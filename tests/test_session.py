@@ -350,32 +350,42 @@ class MousePathTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Réapprovisionnement contre un faux jeu
 # --------------------------------------------------------------------------- #
-RESTOCK_DIR = Path(__file__).resolve().parents[1] / "templates" / "restock"
-NO_BAIT = Path(__file__).resolve().parents[1] / "templates" / "no_bait.png"
+ROOT = Path(__file__).resolve().parents[1]
+RESTOCK_DIR = ROOT / "templates" / "restock"
+EQUIP_BANNER = ROOT / "templates" / "equip_bait_banner.png"
 
 
-def greyed(img):
-    """Icône sur onglet gris (non sélectionné) au lieu d'orange."""
-    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    g = (g - g.min()) / max(1.0, g.max() - g.min()) * 70 + 40
-    return cv2.cvtColor(g.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+def equipped_slot(empty_slot):
+    """Case d'appât après « Switch » : un appât dans le carré, son nom dessous."""
+    img = empty_slot.copy()
+    h, w = img.shape[:2]
+    cv2.circle(img, (w // 2, int(h * 0.36)), int(w * 0.25), (150, 90, 230), -1)
+    img[int(h * 0.8):, :] = 25
+    cv2.putText(img, "Universal Bait", (8, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (255, 255, 255), 2)
+    return img
 
 
 class FakeShop:
-    """Menus du jeu : chaque écran montre un bouton ; un clic dessus (et
-    seulement dessus) ou la bonne touche fait passer à l'écran suivant."""
+    """Menus du jeu : chaque écran montre un bouton ; un clic dans sa zone
+    cliquable (et seulement là) ou la bonne touche fait passer à l'écran suivant."""
 
-    SCREENS = ["no_bait", "menu", "quick_submit", "cube_tab", "quick_sell", "sold",
-               "shop", "universal_bait", "max_quantity", "purchase", "bought", "fishing"]
-    KEYS = {"no_bait": "q", "sold": "esc", "shop_closed": "r", "bought": "esc"}
+    CLICKS = {"slot_empty": "purchase1", "equip_banner": "purchase1",
+              "purchase1": "universal_bait", "universal_bait": "max_quantity",
+              "max_quantity": "purchase2", "purchase2": "bought",
+              "slot_empty2": "switch", "switch": "equipped"}
+    KEYS = {("idle", "f"): "equip_banner", ("bought", "esc"): "bought_esc",
+            ("bought_esc", "esc"): "slot_empty2"}
+    IMAGE = {"slot_empty": "bait_slot_empty", "slot_empty2": "bait_slot_empty",
+             "purchase1": "purchase", "purchase2": "purchase"}
 
     def __init__(self):
         self.screen = "idle"
-        self.keys, self.clicks = [], []
+        self.keys, self.clicks, self.events = [], [], []
         self.button_box = None
         self.images = {p.stem: cv2.imread(str(p)) for p in RESTOCK_DIR.glob("*.png")}
-        self.images["cube_tab"] = greyed(self.images["cube_tab"])
-        self.no_bait = cv2.imread(str(NO_BAIT))
+        self.images["equipped"] = equipped_slot(self.images["bait_slot_empty"])
+        self.banner = cv2.imread(str(EQUIP_BANNER))
 
     # --- clavier ---
     name = "fake"
@@ -385,10 +395,8 @@ class FakeShop:
 
     def down(self, key):
         self.keys.append(key)
-        transitions = {("idle", "f"): "no_bait", ("no_bait", "q"): "quick_submit",
-                       ("sold", "esc"): "closed", ("closed", "r"): "universal_bait",
-                       ("bought", "esc"): "fishing"}
-        self.screen = transitions.get((self.screen, key), self.screen)
+        self.events.append(key)
+        self.screen = self.KEYS.get((self.screen, key), self.screen)
 
     def up(self, key):
         pass
@@ -398,21 +406,22 @@ class FakeShop:
         cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
         bx, by, bw, bh = self.button_box
         self.clicks.append(self.screen)
-        if not (bx <= cx <= bx + bw and by <= cy <= by + bh):
-            return  # clic à côté : rien ne se passe
-        nxt = {"quick_submit": "cube_tab", "cube_tab": "quick_sell", "quick_sell": "sold",
-               "universal_bait": "max_quantity", "max_quantity": "purchase",
-               "purchase": "bought"}
-        self.screen = nxt[self.screen]
+        self.events.append("clic " + self.screen)
+        if self.IMAGE.get(self.screen) == "bait_slot_empty" or self.screen == "equip_banner":
+            bh = bh * 0.7      # case d'appât : seul le carré « + » réagit, pas le texte
+        if bx <= cx <= bx + bw and by <= cy <= by + bh:
+            self.screen = self.CLICKS[self.screen]
 
     # --- écran ---
     def grab(self, region=None):
         canvas = np.full((700, 1000, 3), 35, np.uint8)
-        if self.screen == "no_bait":
-            h, w = self.no_bait.shape[:2]
-            canvas[300:300 + h, 200:200 + w] = self.no_bait
-        elif self.screen in self.images:
-            img = self.images[self.screen]
+        name = self.IMAGE.get(self.screen, self.screen)
+        if self.screen == "equip_banner":
+            h, w = self.banner.shape[:2]
+            canvas[60:60 + h, 200:200 + w] = self.banner
+            name = "bait_slot_empty"
+        if name in self.images:
+            img = self.images[name]
             h, w = img.shape[:2]
             x, y = 300 + 7 * len(self.clicks), 250 + 11 * len(self.clicks)
             canvas[y:y + h, x:x + w] = img
@@ -420,8 +429,11 @@ class FakeShop:
         return canvas
 
 
-@unittest.skipUnless(RESTOCK_DIR.is_dir() and NO_BAIT.exists(), "templates absents")
+@unittest.skipUnless(RESTOCK_DIR.is_dir() and EQUIP_BANNER.exists(), "templates absents")
 class RestockTest(unittest.TestCase):
+    EXPECTED_CLICKS = ["slot_empty", "purchase1", "universal_bait", "max_quantity",
+                       "purchase2", "slot_empty2", "switch"]
+
     def setUp(self):
         self.shop = FakeShop()
         self.saved = (hook.grab, hook.keyboard, hook.human, hook.target, hook.click_box)
@@ -443,20 +455,40 @@ class RestockTest(unittest.TestCase):
     def tearDown(self):
         (hook.grab, hook.keyboard, hook.human, hook.target, hook.click_box) = self.saved
 
-    def cycle(self, restocker):
+    def cycle(self, may_restock=True):
         cfg = self.cfg
-        no_bait, _ = hook.restock_tools(cfg)
+        no_bait, restocker = hook.restock_tools(cfg)
         banner = hook.BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)
         return hook.run_cycle(cfg, banner, hook.GaugeDetector(cfg), 1, None, None,
-                              no_bait, restocker)
+                              no_bait, restocker, may_restock=may_restock)
 
-    def test_full_restock_sequence(self):
-        record = self.cycle(hook.Restocker(self.cfg))
+    def test_empty_slot_before_cycle_buys_and_equips_bait(self):
+        self.shop.screen = "slot_empty"
+        record = self.cycle()
         self.assertEqual(record.outcome, "restock")
-        self.assertEqual(self.shop.screen, "fishing")       # tout le parcours effectué
-        self.assertEqual(self.shop.keys, ["f", "q", "esc", "r", "esc"])
-        self.assertEqual(self.shop.clicks, ["quick_submit", "cube_tab", "quick_sell",
-                                            "universal_bait", "max_quantity", "purchase"])
+        self.assertEqual(self.shop.screen, "equipped")      # tout le parcours effectué
+        self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
+        self.assertEqual(self.shop.keys, ["esc", "esc"])    # F jamais pressé : pas de pêche sans appât
+
+    def test_two_escapes_right_after_purchase(self):
+        self.shop.screen = "slot_empty"
+        self.cycle()
+        events = self.shop.events
+        i = events.index("clic purchase2")
+        self.assertEqual(events[i + 1:i + 3], ["esc", "esc"])
+
+    def test_equipped_slot_does_not_trigger(self):
+        self.shop.screen = "equipped"
+        _, restocker = hook.restock_tools(self.cfg)
+        self.assertFalse(restocker.bait_missing())
+        self.shop.screen = "slot_empty"
+        self.assertTrue(restocker.bait_missing())
+
+    def test_equip_bait_banner_triggers_restock(self):
+        record = self.cycle()                               # F -> « Equip bait before fishing. »
+        self.assertEqual(record.outcome, "restock")
+        self.assertEqual(self.shop.keys[0], "f")
+        self.assertEqual(self.shop.screen, "equipped")
 
     def test_own_escape_is_not_a_stop_request(self):
         hook._ignore_escape_until = 0.0
@@ -465,16 +497,19 @@ class RestockTest(unittest.TestCase):
         self.assertFalse(hook._escape_pressed())
 
     def test_missing_button_aborts_and_closes_menus(self):
-        self.shop.images.pop("purchase")                    # bouton jamais affiché
+        self.shop.images.pop("switch")                      # bouton jamais affiché
+        self.shop.screen = "slot_empty"
         self.cfg.restock_step_timeout = 0.3
         with self.assertRaises(hook.BlockedStop):
-            self.cycle(hook.Restocker(self.cfg))
+            self.cycle()
         self.assertEqual(self.shop.keys[-2:], ["esc", "esc"])
 
     def test_no_second_restock_in_a_row(self):
+        self.shop.screen = "slot_empty"
         with self.assertRaises(hook.BlockedStop) as ctx:
-            self.cycle(None)                                # déjà tenté au cycle précédent
+            self.cycle(may_restock=False)                   # déjà tenté au cycle précédent
         self.assertIn("coquillages", str(ctx.exception))
+        self.assertEqual(self.shop.clicks, [])
 
 
 if __name__ == "__main__":

@@ -11,9 +11,10 @@ Cycle exécuté en boucle :
     4. Jauge disparue : résultat (réussite/échec) lu si possible, appui sur F.
     5. Pause (au moins 3 s, parfois plus longue) puis retour à l'étape 1.
 
-Plus d'appâts (bannière « Equip bait before fishing ») : rachat automatique via
-les menus du jeu (Q, Quick Submit, cube, Quick Sell, Échap, R, Universal Bait,
-quantité max., Purchase, Échap), avec des gestes de souris naturels.
+Plus d'appâts (case « Not Selected » avant un cycle, ou bannière « Equip bait
+before fishing ») : achat et équipement automatiques via les menus du jeu
+(case d'appât, Purchase, Universal Bait, quantité max., Purchase, Échap x2,
+case d'appât, Switch), avec des gestes de souris naturels.
 
 Comportement humain (module session.py) : temps de réaction réalistes, fatigue,
 petites imperfections, sessions de 20-45 min entrecoupées de pauses de 5-15 min.
@@ -152,19 +153,19 @@ class Config:
     max_consecutive_failures: int = 3       # arrêt après N cycles ratés de suite
 
     # --- Réapprovisionnement en appâts --------------------------------------
-    # Déclenché par la bannière « Equip bait before fishing » (templates/no_bait.png).
-    # Étapes : Q, Quick Submit, onglet cube, Quick Sell, Échap, R, Universal Bait
-    # (5 coquillages), quantité max., Purchase, Échap.
+    # Déclenché avant chaque cycle si la case d'appât est vide (« Not Selected »),
+    # ou par la bannière « Equip bait before fishing ». Étapes : voir RESTOCK_STEPS.
     restock_enabled: bool = True
     restock_dir: Path = TEMPLATES_DIR / "restock"
-    no_bait_template: Path = TEMPLATES_DIR / "no_bait.png"
+    no_bait_template: Path = TEMPLATES_DIR / "equip_bait_banner.png"
     restock_threshold: float = 0.80         # boutons texte (niveaux de gris)
     restock_icon_threshold: float = 0.60    # icônes (contours)
     restock_step_timeout: float = 6.0       # attente max. de chaque bouton (s)
     restock_step_delay: Range = (0.35, 0.8) # pause humaine entre deux étapes
-    # Sans templates/no_bait.png : tenter un réapprovisionnement quand la bannière
-    # « Fish on the hook » n'arrive pas (une seule fois avant de compter un échec).
-    restock_on_no_banner: bool = True
+    # Sans templates/equip_bait_banner.png : tenter un réapprovisionnement quand la
+    # bannière « Fish on the hook » n'arrive pas. Inutile tant que la case vide est
+    # vérifiée avant chaque cycle.
+    restock_on_no_banner: bool = False
 
     # --- Session, comportement humain, statistiques -------------------------
     human: HumanConfig = field(default_factory=HumanConfig)
@@ -1227,18 +1228,32 @@ def wait_for_result(cfg: Config, results: MessageDetector) -> str:
 # --------------------------------------------------------------------------- #
 # (action, valeur) : "key" = touche à presser, "click" = bouton (templates/restock/<nom>.png)
 RESTOCK_STEPS: Tuple[Tuple[str, str], ...] = (
-    ("key", "q"),                   # menu
-    ("click", "quick_submit"),
-    ("click", "cube_tab"),          # onglet au cube
-    ("click", "quick_sell"),        # vend les prises : libère l'inventaire, rapporte des coquillages
-    ("key", "esc"),
-    ("key", "r"),                   # boutique
+    ("click", "bait_slot_empty"),   # case d'appât vide (« Not Selected »)
+    ("click", "purchase"),          # ouvre l'achat d'appâts
     ("click", "universal_bait"),    # Universal Bait à 5 coquillages
     ("click", "max_quantity"),      # double chevron : quantité maximale
-    ("click", "purchase"),
+    ("click", "purchase"),          # achat
     ("key", "esc"),
+    ("key", "esc"),
+    ("click", "bait_slot_empty"),   # de nouveau la case d'appât…
+    ("click", "switch"),            # … pour équiper l'appât acheté
 )
-ICON_TEMPLATES = {"cube_tab"}   # comparé par contours : onglet gris ou orange selon la sélection
+ICON_TEMPLATES: set = set()     # modèles comparés par contours (icônes à couleur variable)
+# Seuils plus stricts : la case vide ne doit jamais être confondue avec une case
+# équipée (sinon achat d'appâts à chaque cycle).
+TEMPLATE_THRESHOLDS: Dict[str, float] = {"bait_slot_empty": 0.88}
+# Partie cliquable d'un modèle (fractions gauche, haut, droite, bas) quand ce
+# n'est pas tout le rectangle : pour la case d'appât, le carré « + », pas le texte.
+CLICK_AREAS: Dict[str, Tuple[float, float, float, float]] = {
+    "bait_slot_empty": (0.2, 0.1, 0.8, 0.65),
+}
+
+
+def click_area(name: str, box: Region) -> Region:
+    left, top, right, bottom = CLICK_AREAS.get(name, (0.0, 0.0, 1.0, 1.0))
+    x, y, w, h = box
+    return (int(x + w * left), int(y + h * top),
+            max(1, int(w * (right - left))), max(1, int(h * (bottom - top))))
 
 
 class RestockFailed(Exception):
@@ -1254,16 +1269,20 @@ class Restocker:
         for action, name in RESTOCK_STEPS:
             if action == "click":
                 icon = name in ICON_TEMPLATES
+                threshold = TEMPLATE_THRESHOLDS.get(
+                    name, cfg.restock_icon_threshold if icon else cfg.restock_threshold)
                 self.buttons[name] = BannerDetector(
-                    cfg.restock_dir / f"{name}.png",
-                    cfg.restock_icon_threshold if icon else cfg.restock_threshold,
-                    cfg.banner_scales, edges=icon)
+                    cfg.restock_dir / f"{name}.png", threshold, cfg.banner_scales, edges=icon)
 
-    def wait_for_button(self, name: str) -> Region:
+    def bait_missing(self) -> bool:
+        """True si la case d'appât vide (« Not Selected ») est visible."""
+        return self.buttons["bait_slot_empty"].detect(grab(search_region()))
+
+    def wait_for_button(self, name: str, timeout: Optional[float] = None) -> Region:
         """Attend que le bouton soit visible et immobile (fin d'animation) ;
         renvoie son rectangle en coordonnées écran."""
         detector = self.buttons[name]
-        deadline = time.perf_counter() + self.cfg.restock_step_timeout
+        deadline = time.perf_counter() + (timeout or self.cfg.restock_step_timeout)
         previous: Optional[Region] = None
         while time.perf_counter() < deadline:
             check_stop()
@@ -1283,6 +1302,7 @@ class Restocker:
 
     def run(self) -> None:
         log.info("Réapprovisionnement en appâts…")
+        seen: Dict[str, Region] = {}
         try:
             for action, value in RESTOCK_STEPS:
                 # Rythme humain : courte pause, parfois une hésitation.
@@ -1290,11 +1310,20 @@ class Restocker:
                 if action == "key":
                     log.info("  touche %s", value.upper())
                     tap(value, self.cfg.action_press_duration)
+                    continue
+                if value in seen:
+                    # Élément déjà cliqué (case d'appât) : son aspect peut avoir
+                    # changé après l'achat ; à défaut, on reprend sa position.
+                    try:
+                        box = self.wait_for_button(value, timeout=2.0)
+                    except RestockFailed:
+                        box = seen[value]
                 else:
                     box = self.wait_for_button(value)
-                    sleep(human.reaction())     # temps de repérer le bouton apparu
-                    log.info("  clic sur %s", value)
-                    click_box(box)
+                seen[value] = box
+                sleep(human.reaction())         # temps de repérer le bouton apparu
+                log.info("  clic sur %s", value)
+                click_box(click_area(value, box))
         except RestockFailed:
             # Referme les menus restés ouverts avant d'abandonner.
             for _ in range(2):
@@ -1320,14 +1349,22 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number:
               stoppers: Optional[MessageDetector] = None,
               no_bait: Optional[BannerDetector] = None,
               restocker: Optional[Restocker] = None,
+              may_restock: bool = True,
               may_restock_blind: bool = False) -> CycleRecord:
     """Un cycle complet ; renvoie son résultat pour les statistiques.
 
-    may_restock_blind : sans template no_bait, tenter un réapprovisionnement si
-    la bannière n'arrive pas (le cycle précédent n'en a pas déjà tenté un)."""
+    may_restock       : False juste après un réapprovisionnement (pas deux d'affilée).
+    may_restock_blind : sans bannière « Equip bait » connue, tenter un
+                        réapprovisionnement si la bannière de prise n'arrive pas."""
     results = results or MessageDetector([], cfg.message_threshold, cfg.banner_scales)
     stoppers = stoppers or MessageDetector([], cfg.message_threshold, cfg.banner_scales)
     check_blockers(cfg, stoppers)
+
+    # Avant le cycle : case d'appât vide -> achat et équipement d'appâts.
+    if restocker is not None and restocker.bait_missing():
+        log.warning("Aucun appât équipé (case « Not Selected »).")
+        restock_or_stop(cfg, restocker if may_restock else None)
+        return CycleRecord(number, "restock")
 
     # Étape 1 : lancement
     log.info("Étape 1 : appui sur %s", cfg.key_action.upper())
@@ -1338,12 +1375,12 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number:
     waited = time.perf_counter()
     seen = wait_for_banner(cfg, banner, no_bait)
     if seen == "no_bait":
-        restock_or_stop(cfg, restocker)
+        restock_or_stop(cfg, restocker if may_restock else None)
         return CycleRecord(number, "restock")
     if seen is None:
         log.warning("Bannière non détectée après %.0f s, cycle abandonné.", cfg.banner_timeout)
         check_blockers(cfg, stoppers)
-        if may_restock_blind and restocker is not None:
+        if may_restock_blind and may_restock and restocker is not None:
             log.info("Peut-être plus d'appâts : tentative de réapprovisionnement.")
             restock_or_stop(cfg, restocker)
             return CycleRecord(number, "restock")
@@ -1614,10 +1651,9 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
             # quand il n'y a plus de coquillages.
             just_restocked = bool(stats.records) and stats.records[-1].outcome == "restock"
             record = run_cycle(
-                cfg, banner, gauge, cycle, results, stoppers, no_bait,
-                restocker=None if just_restocked else restocker,
-                may_restock_blind=(no_bait is None and cfg.restock_on_no_banner
-                                   and not just_restocked))
+                cfg, banner, gauge, cycle, results, stoppers, no_bait, restocker,
+                may_restock=not just_restocked,
+                may_restock_blind=no_bait is None and cfg.restock_on_no_banner)
             stats.add(record)
             log.info("%s", stats.line(record))
             if stats.consecutive_failures >= cfg.max_consecutive_failures:

@@ -1,6 +1,45 @@
 # Hook
 
-Boucle de test d'interface automatisée en Python (PyAutoGUI + OpenCV) :
+## ▶ Lancer le bot
+
+Dans **PowerShell**, depuis le dossier du projet :
+
+```powershell
+.\start.bat
+```
+
+C'est tout. Le terminal n'a pas besoin d'être en administrateur : le script demande lui-même
+les droits (fenêtre de confirmation de Windows), car le jeu tourne en administrateur. Au
+premier lancement, il prépare tout seul Python et les dépendances. Un double-clic sur
+`start.bat` fonctionne aussi.
+
+**Sur un autre ordinateur :**
+
+```powershell
+git clone https://github.com/Senku40k8/Hook.git
+cd Hook
+.\start.bat
+```
+
+Le script s'occupe du reste :
+
+- **Python** : il installe Python 3.12 avec `winget` s'il est absent ;
+- **environnement** : il crée `.venv` et installe les dépendances ;
+- **mises à jour** : il réinstalle les dépendances quand `requirements.txt` change ;
+- **dossier copié** : il recrée `.venv` s'il est inutilisable, par exemple s'il vient d'un autre PC.
+
+Il faut seulement Windows 10 ou 11, une connexion Internet au premier lancement, et `git`
+pour cloner. On peut aussi télécharger le ZIP depuis GitHub.
+
+Les options du bot se placent après la commande, par exemple
+`.\start.bat -v --duration 2h`. Elles sont détaillées plus bas.
+
+Au premier lancement sur un PC, **cliquez dans la fenêtre du jeu** : son titre est mémorisé,
+et le bot la mettra ensuite lui-même au premier plan.
+
+## Ce que fait le bot
+
+Boucle automatisée en Python (PyAutoGUI + OpenCV) :
 
 1. appui sur `F`, puis latence aléatoire de 0.5 s à 1.5 s ;
 2. attente de la bannière « Fish on the hook! Press the button to reel it! », puis nouvel appui sur `F` ;
@@ -37,20 +76,21 @@ Activé par défaut (`--robotic` pour le désactiver) :
 
 ## Réapprovisionnement en appâts
 
-Quand la bannière « Equip bait before fishing. » apparaît (`templates/no_bait.png`), le bot
-rachète des appâts tout seul, puis reprend la pêche :
+**Avant chaque cycle**, si la case d'appât est vide (« Not Selected »), le bot achète et
+équipe des appâts tout seul, puis reprend la pêche. La bannière « Equip bait before
+fishing. » déclenche la même chose.
 
-1. `Q`, puis clic sur **Quick Submit** ;
-2. clic sur l'**onglet au cube**, puis **Quick Sell** (vend les prises) ;
-3. `Échap`, puis `R` pour ouvrir la boutique ;
-4. clic sur **Universal Bait** (celui à 5 coquillages), sur le **double chevron** (quantité
+1. clic au centre de la case d'appât vide, puis sur **Purchase** ;
+2. clic sur **Universal Bait** (celui à 5 coquillages), sur le **double chevron** (quantité
    maximale), puis sur **Purchase** ;
-5. `Échap`.
+3. `Échap` **deux fois** (toujours deux, juste après l'achat) ;
+4. nouveau clic au centre de la case d'appât, puis sur **Switch** pour équiper l'appât.
 
 Les boutons sont dans `templates/restock/`. Ils sont recadrés à l'intérieur du contour rose
-de survol, donc ils sont reconnus que la souris soit dessus ou non. L'icône du cube est
-comparée par ses contours : l'onglet est reconnu qu'il soit gris ou orange. Les captures
-d'origine sont conservées dans `templates/originals/`.
+de survol, donc ils sont reconnus que la souris soit dessus ou non. La case d'appât est
+reconnue sur le carré « + » et le texte « Not Selected », pas sur le titre « Select Bait ».
+Une case déjà équipée ne déclenche donc jamais d'achat. Les captures d'origine sont
+conservées dans `templates/originals/`.
 
 Le tout se fait comme un humain :
 
@@ -62,7 +102,7 @@ Le tout se fait comme un humain :
 
 Le bot attend que chaque bouton soit affiché et immobile, à la fin de l'animation, avant de
 cliquer. Si un bouton n'apparaît pas, il ferme les menus avec `Échap` et s'arrête avec une
-alerte. Il ne refait jamais deux réapprovisionnements d'affilée : si la bannière revient
+alerte. Il ne refait jamais deux réapprovisionnements d'affilée : si la case est encore vide
 juste après un achat (plus de coquillages ?), il s'arrête au lieu de boucler.
 
 ## Contrôle, sécurité et statistiques
@@ -82,13 +122,7 @@ juste après un achat (plus de coquillages ?), il s'arrête au lieu de boucler.
   y trouve le résultat, l'attente de la bannière, la durée de la jauge, le nombre d'appuis
   sur Q et D, et la part du temps passée dans le vert. Un résumé s'affiche à l'arrêt.
 
-## Installation
-
-```bash
-pip install -r requirements.txt
-```
-
-## Utilisation
+## Options
 
 Aucun réglage préalable n'est nécessaire. Au **premier lancement**, cliquez dans la fenêtre
 du jeu : son titre est mémorisé. Aux lancements suivants, le bot met lui-même le jeu au
@@ -99,23 +133,25 @@ ignorés pendant le choix. Le bot ne travaille ensuite que dans cette fenêtre :
   programme ne peut pas déclencher le bot) ;
 - si le jeu quitte le premier plan, le bot se met en pause et n'envoie aucune touche.
 
-> **Si F n'a aucun effet en jeu** : lancez le terminal **en administrateur**. Windows bloque,
-> sans aucune erreur, les touches envoyées à un jeu lancé en administrateur (fréquent avec
-> les anti-triche) depuis un programme qui ne l'est pas. Le bot affiche un avertissement
-> quand il détecte ce cas.
+> **Droits administrateur** : `start.bat` les demande automatiquement. Windows bloque, sans
+> aucune erreur, les touches envoyées à un jeu lancé en administrateur (fréquent avec les
+> anti-triche) par un programme qui ne l'est pas.
 
-```bash
-python hook.py                       # boucle infinie
-python hook.py --duration 2h         # 2 heures, puis arrêt avec un bip
-python hook.py --max-fish 100        # 100 poissons, puis arrêt
-python hook.py --record -v          # enregistre le suivi annoté dans debug/track/
-python hook.py --list-windows        # titres des fenêtres ouvertes
-python hook.py --window "Nom du jeu" # cible la fenêtre par son titre (et le mémorise)
-python hook.py --cycles 10 -v        # 10 cycles, logs détaillés
-python hook.py --invert              # si Q/D agissent dans le sens opposé
-python hook.py --input pyautogui     # touches via PyAutoGUI au lieu des scancodes
-python hook.py --reset               # oublie les zones mémorisées
+```powershell
+.\start.bat                          # boucle infinie
+.\start.bat --duration 2h            # 2 heures, puis arrêt avec un bip
+.\start.bat --max-fish 100           # 100 poissons, puis arrêt
+.\start.bat --record -v              # enregistre le suivi annoté dans debug/track/
+.\start.bat --list-windows           # titres des fenêtres ouvertes
+.\start.bat --window "Nom du jeu"    # cible la fenêtre par son titre (et le mémorise)
+.\start.bat --cycles 10 -v           # 10 cycles, logs détaillés
+.\start.bat --invert                 # si Q/D agissent dans le sens opposé
+.\start.bat --input pyautogui        # touches via PyAutoGUI au lieu des scancodes
+.\start.bat --reset                  # oublie les zones mémorisées
 ```
+
+Il est aussi possible d'appeler directement `.venv\Scripts\python.exe hook.py [options]`,
+depuis un terminal administrateur, une fois `start.bat` lancé une première fois.
 
 Au premier cycle, la bannière et la jauge sont cherchées sur tout l'écran. Pour la jauge, une
 barre verte n'est retenue que si la ligne jaune est à côté, ce qui évite de la confondre avec
@@ -131,8 +167,8 @@ le décor. Si l'interface du jeu change, refaites une capture recadrée sur le t
 Les couleurs par défaut de la zone verte et de la ligne jaune sont génériques. Si le bot
 écrit « Jauge non détectée », mesurez les vraies couleurs avec la **jauge visible à l'écran** :
 
-```bash
-python hook.py --setup
+```powershell
+.\start.bat --setup
 ```
 
 Après 10 secondes, une capture d'écran s'ouvre. Tracez successivement à la souris (Entrée
@@ -143,7 +179,7 @@ pour valider, C pour ignorer une étape) :
 3. un rectangle à l'intérieur de la zone verte ;
 4. un rectangle serré autour de la ligne jaune.
 
-Pour vérifier, gardez la jauge à l'écran et lancez `python hook.py --calibrate`. Le dossier
+Pour vérifier, gardez la jauge à l'écran et lancez `.\start.bat --calibrate`. Le dossier
 `debug/` reçoit alors la capture, les masques vert et jaune, ainsi qu'une image annotée
 (rectangle magenta = zone verte, trait rouge = indicateur).
 
@@ -165,8 +201,9 @@ Les touches sont toujours relâchées à l'arrêt.
 
 ## Tests
 
-```bash
-python -m unittest discover -s tests
+```powershell
+.\start.bat -NoAdmin -SetupOnly                       # prépare .venv si besoin
+.\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
 Ces tests ne nécessitent ni écran ni fenêtre cible. Ils vérifient :
@@ -175,4 +212,6 @@ Ces tests ne nécessitent ni écran ni fenêtre cible. Ils vérifient :
 - le comportement humain, les sessions et les statistiques ;
 - l'apprentissage de la vitesse de la ligne et l'inversion automatique de Q et D ;
 - un cycle complet contre un faux jeu, avec bannière, jauge pilotée par Q/D et message de
-  réussite.
+  réussite ;
+- l'achat et l'équipement d'appâts contre une fausse boutique : clics dans les bons boutons,
+  deux `Échap` après l'achat, et aucun achat quand un appât est équipé.
