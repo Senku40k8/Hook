@@ -92,6 +92,7 @@ class Config:
     press_cooldown: Range = (0.04, 0.10)    # intervalle min. entre deux corrections
     cycle_pause: Range = (3.0, 4.5)         # fin de cycle
     startup_countdown: float = 3.0          # temps pour remettre le focus sur la fenêtre
+    setup_countdown: float = 10.0           # temps pour afficher la jauge avant la capture --setup
 
     # --- Délais de garde ----------------------------------------------------
     banner_timeout: float = 60.0            # abandon du cycle si pas de bannière
@@ -543,8 +544,8 @@ def select_box(title: str, image: np.ndarray) -> Optional[Region]:
 
 def setup(cfg: Config, path: Path) -> int:
     """Capture l'écran avec la jauge visible, fait tracer les zones et mesure les couleurs."""
-    log.info("Affichez la jauge à l'écran : capture dans %.0f s…", cfg.startup_countdown)
-    sleep(cfg.startup_countdown)
+    log.info("Affichez la jauge à l'écran : capture dans %.0f s…", cfg.setup_countdown)
+    sleep(cfg.setup_countdown)
     screen = grab()
 
     banner_region = select_box("1/4 - Zone ou apparait la banniere (C = ecran entier)", screen)

@@ -25,7 +25,7 @@ Avec la **jauge visible à l'écran**, lancez :
 python hook.py --setup
 ```
 
-Après 3 secondes, une capture d'écran s'ouvre. Tracez successivement à la souris (Entrée
+Après 10 secondes, une capture d'écran s'ouvre. Tracez successivement à la souris (Entrée
 pour valider, C pour ignorer une étape) :
 
 1. la zone où apparaît la bannière (facultatif, accélère la détection) ;
