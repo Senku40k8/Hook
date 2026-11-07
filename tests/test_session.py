@@ -502,6 +502,8 @@ class RealScreenshotTest(unittest.TestCase):
         restocker = hook.Restocker(hook.Config())
         found = {name for name, det in restocker.buttons.items() if det.detect(img)}
         self.assertEqual(found, {"bait_slot_empty", "start_fishing"})
+        # L'invite « Fishing » n'est pas sur ce panneau : pas de F en trop.
+        self.assertFalse(hook.fishing_prompt_detector(hook.Config()).detect(img))
 
 
 @unittest.skipUnless(RESTOCK_DIR.is_dir() and EQUIP_BANNER.exists(), "templates absents")
@@ -535,7 +537,8 @@ class RestockTest(unittest.TestCase):
         no_bait, restocker = hook.restock_tools(cfg)
         banner = hook.BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)
         return hook.run_cycle(cfg, banner, hook.GaugeDetector(cfg), 1, None, None,
-                              no_bait, restocker, may_restock=may_restock)
+                              no_bait, restocker, may_restock=may_restock,
+                              fishing_prompt=hook.fishing_prompt_detector(cfg))
 
     def test_empty_slot_before_cycle_buys_and_equips_bait(self):
         self.shop.screen = "slot_empty"
@@ -591,6 +594,38 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(self.shop.keys, ["f", "e", "esc", "esc", "e"])
         self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS[1:])
         self.assertEqual(self.shop.screen, "equipped")
+
+    def _spot(self, after_f):
+        """Point de pêche : invite « Fishing » ; F ouvre le panneau de préparation."""
+        self.shop.images["spot"] = cv2.imread(str(ROOT / "templates" / "fishing_prompt.png"))
+        self.shop.images["prep_equipped"] = self.shop.images["start_fishing"]
+        self.shop.KEYS = {**FakeShop.KEYS, ("spot", "f"): after_f}
+        self.shop.CLICKS = dict(FakeShop.CLICKS, prep_equipped="fishing_mode")
+        self.shop.screen = "spot"
+
+    def test_fishing_prompt_presses_f_then_start_fishing(self):
+        self._spot("prep_equipped")
+        _, restocker = hook.restock_tools(self.cfg)
+        entered = hook.enter_fishing_mode(self.cfg, hook.fishing_prompt_detector(self.cfg),
+                                          restocker)
+        self.assertTrue(entered)
+        self.assertEqual(self.shop.keys, ["f"])
+        self.assertEqual(self.shop.clicks, ["prep_equipped"])
+        self.assertEqual(self.shop.screen, "fishing_mode")
+
+    def test_no_fishing_prompt_no_key(self):
+        self.shop.screen = "fishing_mode"
+        _, restocker = hook.restock_tools(self.cfg)
+        self.assertFalse(hook.enter_fishing_mode(
+            self.cfg, hook.fishing_prompt_detector(self.cfg), restocker))
+        self.assertEqual(self.shop.keys, [])
+
+    def test_fishing_prompt_without_bait_goes_to_restock(self):
+        self._spot("slot_empty")                     # F -> panneau avec case vide
+        record = self.cycle()
+        self.assertEqual(record.outcome, "restock")
+        self.assertEqual(self.shop.keys[0], "f")
+        self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
 
     def test_own_escape_is_not_a_stop_request(self):
         hook._ignore_escape_until = 0.0

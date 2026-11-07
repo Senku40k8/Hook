@@ -39,6 +39,12 @@ et le bot la mettra ensuite lui-même au premier plan.
 
 ## Ce que fait le bot
 
+**Prérequis automatique :** au lancement, et avant chaque cycle, si l'invite **« Fishing »**
+du point de pêche est visible, le bot appuie sur `F` pour s'installer. Si le panneau
+« Fishing Preparations » s'ouvre et qu'un appât est équipé, il clique ensuite sur
+**Start Fishing**. Sans appât, le réapprovisionnement ci-dessous s'en charge. Il suffit donc
+de lancer le bot debout devant le point de pêche.
+
 Boucle automatisée en Python (PyAutoGUI + OpenCV) :
 
 1. appui sur `F`, puis latence aléatoire de 0.5 s à 1.5 s ;

@@ -156,6 +156,10 @@ class Config:
     # --- Réapprovisionnement en appâts --------------------------------------
     # Déclenché avant chaque cycle si la case d'appât est vide (« Not Selected »),
     # ou par la bannière « Equip bait before fishing ». Étapes : voir RESTOCK_STEPS.
+    # Invite « Fishing » du point de pêche : F pour s'installer (au lancement ou
+    # si le bot est sorti du mode pêche).
+    fishing_prompt_template: Path = TEMPLATES_DIR / "fishing_prompt.png"
+
     restock_enabled: bool = True
     bait_menu_key: str = "e"                # ouvre la sélection d'appât (« Select Bait »)
     restock_dir: Path = TEMPLATES_DIR / "restock"
@@ -1448,6 +1452,36 @@ class Restocker:
         log.info("Appâts rachetés, reprise de la pêche.")
 
 
+def fishing_prompt_detector(cfg: Config) -> Optional[BannerDetector]:
+    if not cfg.fishing_prompt_template.exists():
+        return None
+    return BannerDetector(cfg.fishing_prompt_template, cfg.message_threshold, cfg.banner_scales)
+
+
+def enter_fishing_mode(cfg: Config, prompt: Optional[BannerDetector],
+                       restocker: Optional[Restocker]) -> bool:
+    """Invite « Fishing » visible (pas encore installé au point de pêche) :
+    appuie sur F, puis lance la pêche avec « Start Fishing » si le panneau de
+    préparation s'ouvre et qu'un appât est équipé (sinon le réapprovisionnement
+    s'en charge)."""
+    if prompt is None or not prompt.detect(grab(search_region())):
+        return False
+    log.info("Invite « Fishing » visible : appui sur %s pour s'installer.", cfg.key_action.upper())
+    sleep(human.reaction())
+    tap(cfg.key_action, cfg.action_press_duration)
+    sleep(human.within((1.0, 1.8)))             # ouverture du panneau de préparation
+    if restocker is not None and not restocker.bait_missing():
+        try:
+            box = restocker.wait_for_button("start_fishing", timeout=2.0, quiet=True)
+        except RestockFailed:
+            return True                         # pas de panneau : déjà en mode pêche
+        sleep(human.reaction())
+        log.info("Clic sur « Start Fishing ».")
+        click_box(box)
+        sleep(human.within((1.0, 1.8)))
+    return True
+
+
 def restock_or_stop(cfg: Config, restocker: Optional[Restocker]) -> None:
     if restocker is None:
         raise BlockedStop("plus d'appâts : réapprovisionnement désactivé, ou déjà tenté "
@@ -1464,7 +1498,8 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number:
               no_bait: Optional[BannerDetector] = None,
               restocker: Optional[Restocker] = None,
               may_restock: bool = True,
-              may_restock_blind: bool = False) -> CycleRecord:
+              may_restock_blind: bool = False,
+              fishing_prompt: Optional[BannerDetector] = None) -> CycleRecord:
     """Un cycle complet ; renvoie son résultat pour les statistiques.
 
     may_restock       : False juste après un réapprovisionnement (pas deux d'affilée).
@@ -1473,6 +1508,9 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number:
     results = results or MessageDetector([], cfg.message_threshold, cfg.banner_scales)
     stoppers = stoppers or MessageDetector([], cfg.message_threshold, cfg.banner_scales)
     check_blockers(cfg, stoppers)
+
+    # Prérequis : invite « Fishing » visible -> F pour s'installer au point de pêche.
+    enter_fishing_mode(cfg, fishing_prompt, restocker)
 
     # Avant le cycle : case d'appât vide -> achat et équipement d'appâts.
     if restocker is not None and restocker.bait_missing():
@@ -1744,6 +1782,7 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
     if stoppers:
         log.info("Messages bloquants surveillés : %s", ", ".join(stoppers.names()))
     no_bait, restocker = restock_tools(cfg)
+    fishing_prompt = fishing_prompt_detector(cfg)
 
     cycle = 0
     while args.cycles == 0 or cycle < args.cycles:
@@ -1767,7 +1806,8 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
             record = run_cycle(
                 cfg, banner, gauge, cycle, results, stoppers, no_bait, restocker,
                 may_restock=not just_restocked,
-                may_restock_blind=no_bait is None and cfg.restock_on_no_banner)
+                may_restock_blind=no_bait is None and cfg.restock_on_no_banner,
+                fishing_prompt=fishing_prompt)
             stats.add(record)
             log.info("%s", stats.line(record))
             if stats.consecutive_failures >= cfg.max_consecutive_failures:
