@@ -221,11 +221,16 @@ PAUSE_VK = 0x77                     # remplacé par cfg.pause_vk dans main()
 _pause_key_was_down = False
 
 
-def _key_is_down(vk: int) -> bool:
-    """Lit l'état d'une touche via l'API Win32 (aucune dépendance externe)."""
+def _key_state(vk: int) -> int:
+    """État brut d'une touche (API Win32 GetAsyncKeyState) :
+    bit 0x8000 = enfoncée maintenant, bit 0x0001 = pressée depuis la dernière lecture."""
     if sys.platform != "win32":
-        return False
-    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+        return 0
+    return ctypes.windll.user32.GetAsyncKeyState(vk) & 0xFFFF
+
+
+def _key_is_down(vk: int) -> bool:
+    return bool(_key_state(vk) & 0x8000)
 
 
 _ignore_escape_until = 0.0         # Échap envoyé par le bot lui-même (menus)
@@ -238,10 +243,14 @@ def _escape_pressed() -> bool:
 
 
 def _pause_toggled() -> bool:
-    """True au moment où la touche de pause est enfoncée (front montant)."""
+    """True au moment où la touche de pause est pressée (front montant).
+
+    Le bit « pressée depuis la dernière lecture » rattrape un appui bref fait
+    pendant une capture d'écran ou une analyse d'image (entre deux lectures)."""
     global _pause_key_was_down
-    down = _key_is_down(PAUSE_VK)
-    toggled = down and not _pause_key_was_down
+    state = _key_state(PAUSE_VK)
+    down = bool(state & 0x8000)
+    toggled = (down or bool(state & 0x0001)) and not _pause_key_was_down
     _pause_key_was_down = down
     return toggled
 
@@ -697,7 +706,7 @@ def click_box(box: Region) -> None:
     oy = max(-0.30, min(0.30, human.rng.gauss(0, 0.12))) * h
     wait_for_focus()
     move_mouse(x + w / 2 + ox, y + h / 2 + oy, min(w, h))
-    sleep(human.within((0.06, 0.22)))           # survol avant de cliquer
+    sleep(human.within((0.04, 0.15)))           # survol avant de cliquer
     pyautogui.mouseDown(_pause=False)
     try:
         sleep(human.within((0.05, 0.12)))
@@ -1275,7 +1284,8 @@ RESTOCK_STEPS: Tuple[Tuple[str, str], ...] = (
     ("click", "purchase"),               # ouvre l'achat d'appâts
     ("click", "universal_bait"),         # Universal Bait à 5 coquillages
     ("click", "max_quantity"),           # double chevron : quantité maximale
-    ("click", "purchase"),               # achat
+    ("click", "purchase"),               # achat…
+    ("click", "confirm"),                # … à confirmer
     ("key", "esc"),
     ("key", "esc"),
     ("bait_dialog", "bait_slot_empty"),  # de nouveau « Switch Bait »…
@@ -1788,6 +1798,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
     human = Humanizer(cfg.human)
     PAUSE_VK = cfg.pause_vk
+    _pause_toggled()            # ignore un appui sur F8 antérieur au lancement
     stats = Stats(cfg.stats_path)
 
     pyautogui.FAILSAFE = True   # souris dans un coin = arrêt immédiat

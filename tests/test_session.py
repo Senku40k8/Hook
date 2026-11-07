@@ -377,7 +377,7 @@ class FakeShop:
     # - après « Switch », le panneau propose « Start Fishing ».
     CLICKS = {"slot_empty": "purchase1",
               "purchase1": "universal_bait", "universal_bait": "max_quantity",
-              "max_quantity": "purchase2", "purchase2": "bought",
+              "max_quantity": "purchase2", "purchase2": "confirm", "confirm": "bought",
               "switch": "start_fishing", "start_fishing": "equipped"}
     KEYS = {("idle", "f"): "equip_banner", ("equip_banner", "e"): "purchase1",
             ("bought", "esc"): "bought_esc", ("bought_esc", "esc"): "fishing_mode",
@@ -448,6 +448,50 @@ class FakeShop:
 PREPARATIONS = ROOT / "templates" / "originals" / "fishing preparations.jpg"
 
 
+# --------------------------------------------------------------------------- #
+# Touche F8 (pause / reprise)
+# --------------------------------------------------------------------------- #
+class PauseKeyTest(unittest.TestCase):
+    """Simule GetAsyncKeyState : 0x8000 = F8 enfoncée, 0x0001 = pressée depuis la
+    dernière lecture."""
+
+    def setUp(self):
+        self.saved = (hook._key_state, hook._pause_key_was_down, hook.keyboard)
+        hook._pause_key_was_down = False
+        hook.keyboard = FakeGame()                     # pour release_all_keys
+
+    def tearDown(self):
+        hook._key_state, hook._pause_key_was_down, hook.keyboard = self.saved
+
+    def feed(self, f8_states):
+        states = iter(f8_states)
+        hook._key_state = lambda vk: next(states, 0) if vk == hook.PAUSE_VK else 0
+
+    def test_press_pauses_and_second_press_resumes(self):
+        # appui (pause), maintenu, relâché, attente, nouvel appui (reprise)
+        self.feed([0x8001, 0x8000, 0, 0, 0, 0x8001])
+        with self.assertRaises(hook.ResumeRequested):
+            hook.check_stop()
+
+    def test_brief_press_between_two_reads_is_not_missed(self):
+        # F8 pressée puis relâchée entre deux lectures : seul le bit 0x0001 le dit.
+        self.feed([0x0001, 0, 0x0001])
+        with self.assertRaises(hook.ResumeRequested):
+            hook.check_stop()
+
+    def test_holding_f8_does_not_toggle_twice(self):
+        hook._key_state = lambda vk: 0x8000 if vk == hook.PAUSE_VK else 0
+        hook._pause_key_was_down = True                # déjà enfoncée au dernier passage
+        hook.check_stop()                              # pas de pause répétée
+
+    def test_keys_released_during_pause(self):
+        hook._held_keys.add("d")
+        self.feed([0x8001, 0, 0x8001])
+        with self.assertRaises(hook.ResumeRequested):
+            hook.check_stop()
+        self.assertEqual(hook._held_keys, set())
+
+
 @unittest.skipUnless(PREPARATIONS.exists(), "capture de référence absente")
 class RealScreenshotTest(unittest.TestCase):
     """Sur une vraie capture du panneau « Fishing Preparations » (07/11) : la case
@@ -463,7 +507,7 @@ class RealScreenshotTest(unittest.TestCase):
 @unittest.skipUnless(RESTOCK_DIR.is_dir() and EQUIP_BANNER.exists(), "templates absents")
 class RestockTest(unittest.TestCase):
     EXPECTED_CLICKS = ["slot_empty", "purchase1", "universal_bait", "max_quantity",
-                       "purchase2", "switch", "start_fishing"]
+                       "purchase2", "confirm", "switch", "start_fishing"]
 
     def setUp(self):
         self.shop = FakeShop()
@@ -507,7 +551,7 @@ class RestockTest(unittest.TestCase):
         self.cycle()
         events = self.shop.events
         i = events.index("clic purchase2")
-        self.assertEqual(events[i + 1:i + 3], ["esc", "esc"])
+        self.assertEqual(events[i + 1:i + 4], ["clic confirm", "esc", "esc"])
 
     def test_first_purchase_still_visible_behind_shop(self):
         """Bug « bloqué après double chevrons » : le 1er Purchase reste affiché
@@ -520,7 +564,7 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(self.shop.screen, "equipped")
         events = self.shop.events
         i = events.index("clic max_quantity")
-        self.assertEqual(events[i + 1:i + 4], ["clic purchase2", "esc", "esc"])
+        self.assertEqual(events[i + 1:i + 5], ["clic purchase2", "clic confirm", "esc", "esc"])
 
     def test_purchase_failure_still_escapes_twice(self):
         self.shop.CLICKS = dict(FakeShop.CLICKS, max_quantity="nothing")  # Purchase n'apparaît pas

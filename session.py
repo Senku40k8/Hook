@@ -192,7 +192,7 @@ def mouse_path(start: Tuple[float, float], end: Tuple[float, float],
     if not natural:
         return _segment(start, end, rng, 0.15, curve=0.0, jitter=0.0)
 
-    fitts = 0.10 + 0.10 * math.log2(dist / max(target_size, 8.0) + 1)
+    fitts = 0.07 + 0.075 * math.log2(dist / max(target_size, 8.0) + 1)
     duration = fitts * rng.uniform(0.85, 1.25) * slowdown
     if dist > 250 and rng.random() < 0.2:
         # Dépassement de 3 à 8 % puis petite correction.
@@ -200,7 +200,7 @@ def mouse_path(start: Tuple[float, float], end: Tuple[float, float],
         mid = (end[0] + (end[0] - start[0]) * over + rng.gauss(0, 4),
                end[1] + (end[1] - start[1]) * over + rng.gauss(0, 4))
         return (_segment(start, mid, rng, duration, curve=0.08, jitter=0.6)
-                + _segment(mid, end, rng, rng.uniform(0.08, 0.16), curve=0.02, jitter=0.3))
+                + _segment(mid, end, rng, rng.uniform(0.06, 0.12), curve=0.02, jitter=0.3))
     return _segment(start, end, rng, duration, curve=0.08, jitter=0.6)
 
 

@@ -82,8 +82,8 @@ fishing. » déclenche la même chose.
 
 1. ouverture de la fenêtre **Switch Bait**, puis clic sur **Purchase** ;
 2. clic sur **Universal Bait** (celui à 5 coquillages), sur le **double chevron** (quantité
-   maximale), puis sur **Purchase** ;
-3. `Échap` **deux fois** (toujours deux, juste après l'achat) ;
+   maximale), sur **Purchase**, puis sur **Confirm** ;
+3. `Échap` **deux fois** (toujours deux, juste après l'achat confirmé) ;
 4. nouvelle ouverture de **Switch Bait**, puis clic sur **Switch** pour équiper l'appât ;
 5. clic sur **Start Fishing** si le panneau « Fishing Preparations » est encore affiché.
 
@@ -112,8 +112,9 @@ juste après un achat (plus de coquillages ?), il s'arrête au lieu de boucler.
 
 ## Contrôle, sécurité et statistiques
 
-- **F8** : pause et reprise. Les touches sont relâchées pendant la pause, et un nouveau cycle
-  démarre à la reprise. F8 écourte aussi une pause de session.
+- **F8** : pause et reprise, à tout moment, y compris pendant la jauge ou un
+  réapprovisionnement. Un appui bref suffit. Les touches sont relâchées pendant la pause, et
+  un nouveau cycle démarre à la reprise. F8 écourte aussi une pause de session.
 - **Arrêt automatique avec alerte sonore** après 3 cycles ratés de suite (bannière ou jauge
   absente, échec, jauge trop longue). Le nombre se règle avec `--max-failures N`.
 - **Messages bloquants** : placez des captures recadrées de ces messages (inventaire plein,
