@@ -90,7 +90,19 @@ Le bot ouvre d'abord la fenêtre **Switch Bait** et regarde ce qu'elle propose :
 
 - **Cancel / Switch** : il reste des appâts, non équipés. Le bot clique sur **Switch**, puis
   sur **Start Fishing** si besoin. Il n'achète rien.
-- **Cancel / Purchase** : il n'y a plus d'appâts, et le bot les achète puis les équipe :
+- **Cancel / Purchase** : il n'y a plus d'appâts. Le bot **vend d'abord les poissons** pour
+  avoir des coquillages, puis il achète et équipe. Tout se fait **sans quitter le mode
+  pêche** : sans appât, on ne pourrait plus relancer « Start Fishing ».
+
+Vente (depuis le mode pêche) :
+
+1. clic sur **Cancel** pour fermer « Switch Bait » ;
+2. `Q`, clic sur **Quick Submit** (et fermeture de « Rewards » si elle apparaît) ;
+3. clic sur l'**onglet au cube**, puis sur **Quick Sell**, puis sur **Confirm** et
+   fermeture de « Rewards » si elles apparaissent ;
+4. `Échap` pour revenir au mode pêche, puis réouverture de « Switch Bait ».
+
+Achat et équipement :
 
 1. clic sur **Purchase** ;
 2. clic sur **Universal Bait** (celui à 5 coquillages), sur le **double chevron** (quantité
@@ -122,8 +134,9 @@ Le tout se fait comme un humain :
 - le bot prend un temps de réaction quand un bouton apparaît, et hésite de temps en temps.
 
 Le bot attend que chaque bouton soit affiché et immobile, à la fin de l'animation, avant de
-cliquer. Si un bouton n'apparaît pas, il ferme les menus avec `Échap` et s'arrête avec une
-alerte. Il ne refait jamais deux réapprovisionnements d'affilée : si la case est encore vide
+cliquer. Si un bouton n'apparaît pas, il appuie sur `Échap` seulement tant qu'un menu connu
+est encore ouvert, pour ne jamais sortir du mode pêche par un `Échap` de trop. Il s'arrête
+ensuite avec une alerte et une capture dans `debug/`. Il ne refait jamais deux réapprovisionnements d'affilée : si la case est encore vide
 juste après un achat (plus de coquillages ?), il s'arrête au lieu de boucler.
 
 ## Contrôle, sécurité et statistiques

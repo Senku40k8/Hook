@@ -1306,9 +1306,28 @@ BUY_STEPS: Tuple[Tuple[str, str], ...] = (
     ("key", "esc"),
     ("bait_dialog", "bait_slot_empty"),  # de nouveau « Switch Bait »…
 ) + EQUIP_STEPS                          # … puis Switch pour équiper l'appât acheté
-RESTOCK_BUTTONS = sorted({name for action, name in BUY_STEPS if action != "key"}
+# Plus d'appâts : vendre d'abord les poissons pour avoir des coquillages, depuis
+# le mode pêche (en sortir sans appât empêche de relancer « Start Fishing »).
+SELL_STEPS: Tuple[Tuple[str, str], ...] = (
+    ("click", "cancel"),                 # ferme « Switch Bait » sans quitter le mode pêche
+    ("key", "q"),                        # menu
+    ("click", "quick_submit"),
+    ("dismiss", "rewards_close"),        # fenêtre de récompense éventuelle
+    ("click", "cube_tab"),               # onglet au cube
+    ("click", "quick_sell"),             # vend les poissons : rapporte des coquillages
+    ("optional", "confirm"),             # confirmation éventuelle
+    ("dismiss", "rewards_close"),        # fenêtre de récompense éventuelle
+    ("key", "esc"),                      # retour au mode pêche
+    ("bait_dialog", "bait_slot_empty"),  # rouvre « Switch Bait » pour acheter
+)
+RESTOCK_BUTTONS = sorted({name for steps in (SELL_STEPS, BUY_STEPS)
+                          for action, name in steps if action != "key"}
                          | {"bait_slot_empty"})
-ICON_TEMPLATES: set = set()     # modèles comparés par contours (icônes à couleur variable)
+# Boutons qui indiquent qu'un menu est encore ouvert (à fermer avec Échap après
+# un échec) ; le panneau « Fishing Preparations » n'en fait pas partie.
+MENU_BUTTONS = ("cancel", "switch", "purchase", "confirm", "universal_bait", "max_quantity",
+                "quick_submit", "quick_sell", "cube_tab", "rewards_close")
+ICON_TEMPLATES = {"cube_tab"}   # par contours : l'onglet est gris ou orange selon la sélection
 # Seuils plus stricts : la case vide ne doit jamais être confondue avec une case
 # équipée (sinon achat d'appâts à chaque cycle).
 TEMPLATE_THRESHOLDS: Dict[str, float] = {"bait_slot_empty": 0.88}
@@ -1393,9 +1412,9 @@ class Restocker:
     def dismiss_popup(self, name: str) -> None:
         """Ferme une fenêtre du type « Rewards » en cliquant dans une zone vide."""
         try:
-            hint = self.wait_for_button(name, timeout=4.0, quiet=True)
+            hint = self.wait_for_button(name, timeout=3.0, quiet=True)
         except RestockFailed:
-            log.info("  pas de fenêtre « Rewards » à fermer")
+            log.debug("  pas de fenêtre « Rewards » à fermer")
             return
         x, y, w, h = hint
         empty_area = (x + w // 6, int(y - 2.6 * h), w * 2 // 3, int(1.4 * h))
@@ -1472,6 +1491,23 @@ class Restocker:
         except Exception:
             pass
 
+    def menu_open(self) -> bool:
+        """True si un menu connu (Switch Bait, boutique, vente…) est affiché."""
+        frame = grab(search_region())
+        return any(self.buttons[name].detect(frame) for name in MENU_BUTTONS)
+
+    def close_menus(self) -> None:
+        """Après un échec : Échap tant qu'un menu connu est ouvert (au plus 3),
+        pour ne pas sortir du mode pêche par un Échap de trop. Seulement si le
+        jeu est au premier plan (sinon on attendrait indéfiniment)."""
+        for _ in range(3):
+            time.sleep(human.within((0.3, 0.6)))
+            if target is not None and not target.is_foreground():
+                return
+            if not self.menu_open():
+                return
+            tap("esc", self.cfg.action_press_duration)
+
     def run(self) -> None:
         log.info("Aucun appât équipé : ouverture de « Switch Bait »…")
         try:
@@ -1481,15 +1517,15 @@ class Restocker:
                 log.info("Appâts en stock : équipement direct.")
                 self._run_steps(EQUIP_STEPS)
             else:
-                log.info("Plus d'appâts : achat d'Universal Bait puis équipement.")
-                self._run_steps(BUY_STEPS)
+                log.info("Plus d'appâts : vente des poissons (coquillages), puis achat "
+                         "d'Universal Bait, puis équipement.")
+                self._run_steps(SELL_STEPS)
+                if self.wait_for_any(("purchase", "switch")) == "switch":
+                    self._run_steps(EQUIP_STEPS)
+                else:
+                    self._run_steps(BUY_STEPS)
         except RestockFailed:
-            # Referme les menus restés ouverts avant d'abandonner, mais seulement
-            # si le jeu est au premier plan (sinon on attendrait indéfiniment).
-            for _ in range(2):
-                time.sleep(human.within((0.3, 0.6)))
-                if target is None or target.is_foreground():
-                    tap("esc", self.cfg.action_press_duration)
+            self.close_menus()
             raise
         sleep(human.within((0.8, 1.5)))
         if self.bait_missing():

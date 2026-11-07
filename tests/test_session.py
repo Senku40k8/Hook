@@ -366,38 +366,60 @@ def equipped_slot(empty_slot):
     return img
 
 
+def greyed(img):
+    """Icône sur onglet gris (non sélectionné) au lieu d'orange."""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g = (g - g.min()) / max(1.0, g.max() - g.min()) * 70 + 40
+    return cv2.cvtColor(g.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+
 class FakeShop:
-    """Menus du jeu : chaque écran montre un bouton ; un clic dans sa zone
-    cliquable (et seulement là) ou la bonne touche fait passer à l'écran suivant."""
+    """Faux jeu pour les menus d'appâts, calqué sur les captures du 07/11 :
 
-    # Comme dans le jeu (captures du 07/11) :
-    # - panneau « Fishing Preparations » : clic sur la case vide -> « Switch Bait » ;
-    # - en mode pêche, E ouvre directement « Switch Bait » (Cancel / Purchase) ;
-    # - la bannière « Equip bait » n'ouvre rien ;
-    # - après « Switch », le panneau propose « Start Fishing ».
-    CLICKS = {"slot_empty": "purchase1",
-              "purchase1": "universal_bait", "universal_bait": "max_quantity",
-              "max_quantity": "purchase2", "purchase2": "confirm", "confirm": "rewards",
-              "switch": "start_fishing", "start_fishing": "equipped"}
-    KEYS = {("idle", "f"): "equip_banner", ("equip_banner", "e"): "purchase1",
-            ("bought", "esc"): "bought_esc", ("bought_esc", "esc"): "fishing_mode",
-            ("fishing_mode", "e"): "switch"}
-    IMAGE = {"slot_empty": "bait_slot_empty",
-             "purchase1": "purchase", "purchase2": "purchase",
-             "rewards": "rewards_close"}
+    - panneau « Fishing Preparations » (« slot_empty ») : clic sur la case vide
+      -> fenêtre « Switch Bait » ; en mode pêche, E ouvre la même fenêtre ;
+    - « Switch Bait » : Cancel / Switch s'il reste des appâts, Cancel / Purchase
+      sinon ; Cancel ou Échap ramène à l'écran d'origine ;
+    - vente : Q, Quick Submit (+ Rewards), onglet cube, Quick Sell, Confirm,
+      Rewards, Échap ; rapporte des coquillages ;
+    - boutique : Universal Bait, double chevron, Purchase (sans coquillages : rien
+      ne se passe), Confirm, Rewards (fermée par un clic dans le vide, pas par
+      Échap), puis Échap x2 ;
+    - en mode pêche, un Échap de trop fait sortir du mode pêche (« left_fishing »).
+    """
 
-    def __init__(self, ghost_purchase=False):
+    def __init__(self, stock=0, shells=0, sell_gives=100):
         self.screen = "idle"
-        self.keys, self.clicks, self.events = [], [], []
-        self.button_box = None
-        # Le 1er « Purchase » reste visible derrière la boutique (cas réel).
-        self.ghost_purchase = ghost_purchase
+        self.origin = "fishing_mode"           # où ramène la fermeture de « Switch Bait »
+        self.stock, self.shells, self.sell_gives = stock, shells, sell_gives
+        self.equip_works = True
+        self.ghost_purchase = False            # 1er Purchase visible derrière la boutique
         self.ghost_box = None
+        self.keys, self.clicks, self.events = [], [], []
+        self.drawn = []                        # (bouton, rectangle) de l'écran courant
         self.images = {p.stem: cv2.imread(str(p)) for p in RESTOCK_DIR.glob("*.png")}
+        self.images["cube_tab"] = greyed(self.images["cube_tab"])
         self.images["equipped"] = equipped_slot(self.images["bait_slot_empty"])
+        self.images["fishing_prompt"] = cv2.imread(str(ROOT / "templates" / "fishing_prompt.png"))
         self.banner = cv2.imread(str(EQUIP_BANNER))
 
-    # --- clavier ---
+    # --- ce qui est affiché ---------------------------------------------------
+    def buttons(self):
+        s = self.screen
+        if s == "dialog":
+            return ["cancel", "switch" if self.stock else "purchase"]
+        return {
+            "slot_empty": ["bait_slot_empty"], "spot": ["fishing_prompt"],
+            "prep_equipped": ["start_fishing"], "start_panel": ["start_fishing"],
+            "equipped": ["equipped"],
+            "menu": ["quick_submit"], "submit_rewards": ["rewards_close"],
+            "menu2": ["cube_tab"], "sell_tab": ["quick_sell"], "sell_confirm": ["confirm"],
+            "sell_rewards": ["rewards_close"],
+            "shop": ["universal_bait"], "shop_item": ["max_quantity"], "shop_max": ["purchase"],
+            "buy_confirm": ["confirm"], "buy_rewards": ["rewards_close"],
+        }.get(s, [])
+
+    # --- clavier ---------------------------------------------------------------
     name = "fake"
 
     def prepare(self, keys):
@@ -406,49 +428,103 @@ class FakeShop:
     def down(self, key):
         self.keys.append(key)
         self.events.append(key)
-        self.screen = self.KEYS.get((self.screen, key), self.screen)
+        s = self.screen
+        if key == "f" and s == "idle":
+            self.screen = "equip_banner"
+        elif key == "f" and s == "spot":
+            self.screen = self.after_spot
+        elif key == "e" and s in ("fishing_mode", "equip_banner"):
+            self.origin = "fishing_mode"
+            self.screen = "dialog"
+        elif key == "q" and s in ("fishing_mode", "slot_empty", "equip_banner"):
+            self.menu_origin = "fishing_mode" if s == "equip_banner" else s
+            self.screen = "menu"
+        elif key == "esc":
+            menu_origin = getattr(self, "menu_origin", "fishing_mode")
+            shop = ("shop", "shop_item", "shop_max", "buy_confirm", "shop_done")
+            menus = ("menu", "menu2", "sell_tab", "sell_confirm", "menu_after")
+            if s in shop:
+                self.screen = "dialog"                 # la boutique se ferme sur « Switch Bait »
+            elif s in menus:
+                self.screen = menu_origin
+            else:                                      # « Rewards » : Échap sans effet
+                self.screen = {"dialog": self.origin, "fishing_mode": "left_fishing"}.get(s, s)
 
     def up(self, key):
         pass
 
-    # --- souris ---
+    # --- souris ------------------------------------------------------------------
     def click(self, box):
         cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
-        bx, by, bw, bh = self.button_box
-        self.clicks.append(self.screen)
-        self.events.append("clic " + self.screen)
-        if self.screen == "rewards":
-            # « Press empty area to close » : seul un clic hors du texte, au-dessus
-            # (zone vide), ferme la fenêtre. Échap n'a aucun effet.
-            if cy < by:
-                self.screen = "bought"
-            return
-        if self.screen not in self.CLICKS:
-            return             # rien de cliquable sur cet écran
-        if self.IMAGE.get(self.screen) == "bait_slot_empty":
-            bh = bh * 0.7      # case d'appât : seul le carré « + » réagit, pas le texte
-        if bx <= cx <= bx + bw and by <= cy <= by + bh:
-            self.screen = self.CLICKS[self.screen]
+        hit = None
+        for name, (bx, by, bw, bh) in self.drawn:
+            if name == "rewards_close":
+                if cy < by:                    # zone vide au-dessus du texte
+                    hit = name
+                continue
+            if name == "bait_slot_empty":
+                bh = bh * 0.7                  # seul le carré « + » réagit, pas le texte
+            if bx <= cx <= bx + bw and by <= cy <= by + bh:
+                hit = name
+        self.clicks.append(hit or "?")
+        self.events.append(f"clic {hit or '?'}")
+        s = self.screen
+        if hit == "bait_slot_empty":
+            self.origin, self.screen = "slot_empty", "dialog"
+        elif hit == "cancel":
+            self.screen = self.origin
+        elif hit == "switch":
+            if self.equip_works:
+                self.stock -= 1
+                self.screen = "start_panel"
+            else:
+                self.screen = "slot_empty"
+        elif hit == "start_fishing":
+            self.screen = "equipped" if s == "start_panel" else "fishing_mode"
+        elif hit == "purchase" and s == "dialog":
+            self.screen = "shop"
+        elif hit == "purchase" and s == "shop_max":
+            if self.shells >= 5:
+                self.shells -= 5
+                self.screen = "buy_confirm"
+        elif hit is not None:
+            self.screen = {
+                "quick_submit": "submit_rewards", "cube_tab": "sell_tab",
+                "quick_sell": "sell_confirm", "universal_bait": "shop_item",
+                "max_quantity": "shop_max",
+            }.get(hit, self.screen)
+            if hit == "confirm":
+                if s == "sell_confirm":
+                    self.shells += self.sell_gives
+                    self.screen = "sell_rewards"
+                else:
+                    self.stock = 99
+                    self.screen = "buy_rewards"
+            if hit == "rewards_close":
+                self.screen = {"submit_rewards": "menu2", "sell_rewards": "menu_after",
+                               "buy_rewards": "shop_done"}[s]
 
-    # --- écran ---
+    # --- écran ----------------------------------------------------------------------
     def grab(self, region=None):
         canvas = np.full((1000, 1000, 3), 35, np.uint8)
-        name = self.IMAGE.get(self.screen, self.screen)
         if self.screen == "equip_banner":
             h, w = self.banner.shape[:2]
             canvas[20:20 + h, 200:200 + w] = self.banner
-        if self.ghost_purchase and self.ghost_box and self.screen in (
-                "universal_bait", "max_quantity", "purchase2"):
+        if self.ghost_purchase and self.ghost_box and self.screen in ("shop", "shop_item", "shop_max"):
             gx, gy, gw, gh = self.ghost_box
             canvas[gy:gy + gh, gx:gx + gw] = self.images["purchase"]
-        if name in self.images:
-            img = self.images[name]
+        self.drawn = []
+        shift = 5 * (len(self.clicks) % 8)     # les boutons bougent un peu d'un écran à l'autre
+        for i, name in enumerate(self.buttons()):
+            img = self.images.get(name)
+            if img is None:
+                continue                           # bouton retiré par le test
             h, w = img.shape[:2]
-            x, y = 300 + 7 * len(self.clicks), 100 + 70 * len(self.clicks)
+            x, y = 250 + 330 * i + shift, 300 + 8 * shift
             canvas[y:y + h, x:x + w] = img
-            self.button_box = (x, y, w, h)
-            if self.screen == "purchase1":
-                self.ghost_box = self.button_box
+            self.drawn.append((name, (x, y, w, h)))
+            if name == "purchase" and self.screen == "dialog":
+                self.ghost_box = (x, y, w, h)
         return canvas
 
 
@@ -544,8 +620,10 @@ class RealScreenshotTest(unittest.TestCase):
 
 @unittest.skipUnless(RESTOCK_DIR.is_dir() and EQUIP_BANNER.exists(), "templates absents")
 class RestockTest(unittest.TestCase):
-    EXPECTED_CLICKS = ["slot_empty", "purchase1", "universal_bait", "max_quantity",
-                       "purchase2", "confirm", "rewards", "switch", "start_fishing"]
+    SELL = ["cancel", "quick_submit", "rewards_close", "cube_tab", "quick_sell", "confirm",
+            "rewards_close"]
+    BUY = ["purchase", "universal_bait", "max_quantity", "purchase", "confirm", "rewards_close"]
+    EQUIP = ["switch", "start_fishing"]
 
     def setUp(self):
         self.shop = FakeShop()
@@ -576,45 +654,83 @@ class RestockTest(unittest.TestCase):
                               no_bait, restocker, may_restock=may_restock,
                               fishing_prompt=hook.fishing_prompt_detector(cfg))
 
-    def test_empty_slot_before_cycle_buys_and_equips_bait(self):
+    # --- plus d'appâts : vendre, acheter, équiper ----------------------------------
+    def test_no_bait_from_fishing_mode_sells_buys_equips(self):
+        """Cas du 07/11 : plus d'appâts en pêchant. Vente d'abord (coquillages),
+        puis achat, puis équipement, sans jamais sortir du mode pêche."""
+        record = self.cycle()                               # F -> « Equip bait before fishing. »
+        self.assertEqual(record.outcome, "restock")
+        self.assertEqual(self.shop.clicks, self.SELL + self.BUY + self.EQUIP)
+        self.assertEqual(self.shop.keys, ["f", "e", "q", "esc", "e", "esc", "esc", "e"])
+        self.assertNotIn("left_fishing", self.shop.screen)  # jamais sorti du mode pêche
+        self.assertEqual(self.shop.screen, "equipped")
+        self.assertEqual(self.shop.stock, 98)               # 99 achetés, 1 équipé
+
+    def test_no_bait_from_preparations_panel(self):
         self.shop.screen = "slot_empty"
         record = self.cycle()
         self.assertEqual(record.outcome, "restock")
-        self.assertEqual(self.shop.screen, "equipped")      # tout le parcours effectué
-        self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
-        # F jamais pressé (pas de pêche sans appât) ; E rouvre le panneau après les Échap.
-        self.assertEqual(self.shop.keys, ["esc", "esc", "e"])
+        slot = ["bait_slot_empty"]
+        self.assertEqual(self.shop.clicks, slot + self.SELL + slot + self.BUY + slot + self.EQUIP)
+        self.assertEqual(self.shop.screen, "equipped")
 
-    def test_two_escapes_right_after_purchase(self):
-        self.shop.screen = "slot_empty"
+    def test_sell_comes_before_any_purchase(self):
+        self.cycle()
+        clicks = self.shop.clicks
+        self.assertLess(clicks.index("quick_sell"), clicks.index("universal_bait"))
+        self.assertGreaterEqual(self.shop.shells, 0)
+
+    def test_two_escapes_right_after_purchase_confirm(self):
         self.cycle()
         events = self.shop.events
-        i = events.index("clic purchase2")
-        self.assertEqual(events[i + 1:i + 5], ["clic confirm", "clic rewards", "esc", "esc"])
+        i = max(k for k, e in enumerate(events) if e == "clic confirm")   # confirmation d'achat
+        self.assertEqual(events[i + 1:i + 4], ["clic rewards_close", "esc", "esc"])
 
     def test_first_purchase_still_visible_behind_shop(self):
-        """Bug « bloqué après double chevrons » : le 1er Purchase reste affiché
-        derrière la boutique ; le bot doit cliquer le nouveau, puis Échap x2."""
+        """Le 1er Purchase reste affiché derrière la boutique : le bot clique le
+        nouveau (après double chevrons), pas celui de derrière."""
         self.shop.ghost_purchase = True
+        record = self.cycle()
+        self.assertEqual(record.outcome, "restock")
+        self.assertEqual(self.shop.clicks, self.SELL + self.BUY + self.EQUIP)
+        self.assertEqual(self.shop.stock, 98)
+
+    def test_no_shells_even_after_selling_stops_without_leaving_fishing(self):
+        """Vente sans effet (rien à vendre) : l'achat échoue ; le bot referme les
+        menus avec Échap tant qu'un menu est ouvert, mais pas un de plus."""
+        self.shop.sell_gives = 0
+        self.cfg.restock_step_timeout = 0.5
+        with self.assertRaises(hook.BlockedStop):
+            self.cycle()
+        self.assertNotEqual(self.shop.screen, "left_fishing")
+        self.assertEqual(self.shop.screen, "fishing_mode")
+
+    # --- appâts en stock : équiper seulement ---------------------------------------
+    def test_bait_in_stock_is_equipped_without_buying(self):
+        """Cas de 17:07 : 99 appâts en stock, non équipés -> Switch directement."""
+        self.shop.stock = 99
         self.shop.screen = "slot_empty"
         record = self.cycle()
         self.assertEqual(record.outcome, "restock")
-        self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
+        self.assertEqual(self.shop.clicks, ["bait_slot_empty"] + self.EQUIP)
+        self.assertEqual(self.shop.keys, [])                # ni vente, ni achat, ni Échap
         self.assertEqual(self.shop.screen, "equipped")
-        events = self.shop.events
-        i = events.index("clic max_quantity")
-        self.assertEqual(events[i + 1:i + 6],
-                         ["clic purchase2", "clic confirm", "clic rewards", "esc", "esc"])
 
-    def test_purchase_failure_still_escapes_twice(self):
-        self.shop.CLICKS = dict(FakeShop.CLICKS, max_quantity="nothing")  # Purchase n'apparaît pas
+    def test_bait_in_stock_from_fishing_mode_with_e(self):
+        self.shop.stock = 99
+        self.shop.screen = "fishing_mode"
+        _, restocker = hook.restock_tools(self.cfg)
+        restocker.run()
+        self.assertEqual(self.shop.keys, ["e"])
+        self.assertEqual(self.shop.clicks, self.EQUIP)
+
+    def test_not_equipped_is_reported(self):
+        self.shop.stock = 99
+        self.shop.equip_works = False                       # Switch sans effet
         self.shop.screen = "slot_empty"
-        self.cfg.restock_step_timeout = 0.4
-        with self.assertRaises(hook.BlockedStop):
+        with self.assertRaises(hook.BlockedStop) as ctx:
             self.cycle()
-        events = self.shop.events
-        i = events.index("clic max_quantity")
-        self.assertEqual(events[i + 1:], ["esc", "esc"])
+        self.assertIn("pas équipés", str(ctx.exception))
 
     def test_equipped_slot_does_not_trigger(self):
         self.shop.screen = "equipped"
@@ -623,31 +739,14 @@ class RestockTest(unittest.TestCase):
         self.shop.screen = "slot_empty"
         self.assertTrue(restocker.bait_missing())
 
-    def test_equip_bait_banner_triggers_restock(self):
-        record = self.cycle()                               # F -> « Equip bait before fishing. »
-        self.assertEqual(record.outcome, "restock")
-        # F, puis E qui ouvre directement « Switch Bait » (cas du blocage) : pas de
-        # case à cliquer, on enchaîne sur Purchase.
-        self.assertEqual(self.shop.keys, ["f", "e", "esc", "esc", "e"])
-        self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS[1:])
-        self.assertEqual(self.shop.screen, "equipped")
-
-    def _spot(self, after_f):
-        """Point de pêche : invite « Fishing » ; F ouvre le panneau de préparation."""
-        self.shop.images["spot"] = cv2.imread(str(ROOT / "templates" / "fishing_prompt.png"))
-        self.shop.images["prep_equipped"] = self.shop.images["start_fishing"]
-        self.shop.KEYS = {**FakeShop.KEYS, ("spot", "f"): after_f}
-        self.shop.CLICKS = dict(FakeShop.CLICKS, prep_equipped="fishing_mode")
-        self.shop.screen = "spot"
-
+    # --- invite « Fishing » -----------------------------------------------------------
     def test_fishing_prompt_presses_f_then_start_fishing(self):
-        self._spot("prep_equipped")
+        self.shop.screen, self.shop.after_spot = "spot", "prep_equipped"
         _, restocker = hook.restock_tools(self.cfg)
-        entered = hook.enter_fishing_mode(self.cfg, hook.fishing_prompt_detector(self.cfg),
-                                          restocker)
-        self.assertTrue(entered)
+        self.assertTrue(hook.enter_fishing_mode(
+            self.cfg, hook.fishing_prompt_detector(self.cfg), restocker))
         self.assertEqual(self.shop.keys, ["f"])
-        self.assertEqual(self.shop.clicks, ["prep_equipped"])
+        self.assertEqual(self.shop.clicks, ["start_fishing"])
         self.assertEqual(self.shop.screen, "fishing_mode")
 
     def test_no_fishing_prompt_no_key(self):
@@ -658,42 +757,13 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(self.shop.keys, [])
 
     def test_fishing_prompt_without_bait_goes_to_restock(self):
-        self._spot("slot_empty")                     # F -> panneau avec case vide
+        self.shop.screen, self.shop.after_spot = "spot", "slot_empty"
         record = self.cycle()
         self.assertEqual(record.outcome, "restock")
         self.assertEqual(self.shop.keys[0], "f")
-        self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
-
-    def test_bait_in_stock_is_equipped_without_buying(self):
-        """Bug du 07/11 à 17:07 : 99 appâts en stock mais non équipés. « Switch
-        Bait » affiche Cancel / Switch (pas Purchase) : le bot doit cliquer
-        Switch, sans rien acheter."""
-        self.shop.CLICKS = dict(FakeShop.CLICKS, slot_empty="switch")
-        self.shop.screen = "slot_empty"
-        record = self.cycle()
-        self.assertEqual(record.outcome, "restock")
-        self.assertEqual(self.shop.clicks, ["slot_empty", "switch", "start_fishing"])
-        self.assertEqual(self.shop.keys, [])                # ni achat, ni Échap
         self.assertEqual(self.shop.screen, "equipped")
 
-    def test_bait_in_stock_from_fishing_mode_with_e(self):
-        """En mode pêche (pas de panneau) : E ouvre « Switch Bait », puis Switch."""
-        self.shop.KEYS = {**FakeShop.KEYS, ("fishing_mode", "e"): "switch"}
-        self.shop.screen = "fishing_mode"
-        _, restocker = hook.restock_tools(self.cfg)
-        restocker.run()
-        self.assertEqual(self.shop.keys, ["e"])
-        self.assertEqual(self.shop.clicks, ["switch", "start_fishing"])
-
-    def test_bought_but_not_equipped_is_reported(self):
-        """Après Switch, la case est toujours vide : le bot ne repart pas pêcher
-        comme si de rien n'était, il signale l'échec."""
-        self.shop.CLICKS = dict(FakeShop.CLICKS, switch="slot_empty")
-        self.shop.screen = "slot_empty"
-        with self.assertRaises(hook.BlockedStop) as ctx:
-            self.cycle()
-        self.assertIn("pas équipés", str(ctx.exception))
-
+    # --- échecs et sécurité -------------------------------------------------------------
     def test_own_escape_is_not_a_stop_request(self):
         hook._ignore_escape_until = 0.0
         hook.tap("esc", (0.001, 0.001))
@@ -701,8 +771,7 @@ class RestockTest(unittest.TestCase):
         self.assertFalse(hook._escape_pressed())
 
     def test_failure_does_not_wait_for_focus(self):
-        """Échec pendant que le jeu n'est plus au premier plan : arrêt immédiat,
-        sans attendre le jeu pour envoyer Échap (le « bloqué » du log)."""
+        """Échec pendant que le jeu n'est plus au premier plan : arrêt immédiat."""
         class Game:
             title = "NTE"
             lost = False                              # passe en arrière-plan à l'échec
@@ -714,23 +783,28 @@ class RestockTest(unittest.TestCase):
                 return (0, 0, 1000, 1000)
         game = Game()
         hook.target = game
-        self.shop.screen = "idle_no_panel"           # case jamais visible, E sans effet
+        self.shop.screen = "nothing"                  # E sans effet, rien à l'écran
         self.cfg.restock_step_timeout = 0.3
         restocker = hook.Restocker(self.cfg)
-        restocker._save_failure = lambda *a: setattr(game, "lost", True)
+        restocker._save_failure = lambda *a, **k: setattr(game, "lost", True)
         started = hook.time.perf_counter()
         with self.assertRaises(hook.RestockFailed):
             restocker.run()
-        self.assertLess(hook.time.perf_counter() - started, 5)   # pas d'attente du jeu
+        self.assertLess(hook.time.perf_counter() - started, 5)
         self.assertEqual(self.shop.keys, ["e"])                  # aucun Échap hors du jeu
 
-    def test_missing_button_aborts_and_closes_menus(self):
-        self.shop.images.pop("switch")                      # bouton jamais affiché
-        self.shop.screen = "slot_empty"
+    def test_failure_closes_menus_only_while_open(self):
+        """Bouton introuvable dans « Switch Bait » : un seul Échap (la fenêtre se
+        ferme), pas de second qui ferait quitter le mode pêche."""
+        self.shop.stock = 99
+        self.shop.images.pop("switch")                      # bouton jamais reconnu
+        self.shop.screen = "fishing_mode"
         self.cfg.restock_step_timeout = 0.3
-        with self.assertRaises(hook.BlockedStop):
-            self.cycle()
-        self.assertEqual(self.shop.keys[-2:], ["esc", "esc"])
+        _, restocker = hook.restock_tools(self.cfg)
+        with self.assertRaises(hook.RestockFailed):
+            restocker.run()
+        self.assertEqual(self.shop.keys, ["e", "esc"])
+        self.assertEqual(self.shop.screen, "fishing_mode")
 
     def test_no_second_restock_in_a_row(self):
         self.shop.screen = "slot_empty"
