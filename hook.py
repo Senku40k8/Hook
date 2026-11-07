@@ -1283,6 +1283,9 @@ def wait_for_result(cfg: Config, results: MessageDetector) -> str:
 #   "bait_dialog" ouvre la fenêtre « Switch Bait » : clic sur la case d'appât si
 #                 le panneau « Fishing Preparations » est affiché, sinon touche E
 #   "optional"    bouton cliqué seulement s'il est affiché
+#   "dismiss"     fenêtre qui se ferme en cliquant dans une zone vide (Échap
+#                 ne la ferme pas) : repérée par son texte « Press empty area
+#                 to close », on clique juste au-dessus, hors de la fenêtre
 RESTOCK_STEPS: Tuple[Tuple[str, str], ...] = (
     ("bait_dialog", "bait_slot_empty"),  # fenêtre « Switch Bait »
     ("click", "purchase"),               # ouvre l'achat d'appâts
@@ -1290,6 +1293,7 @@ RESTOCK_STEPS: Tuple[Tuple[str, str], ...] = (
     ("click", "max_quantity"),           # double chevron : quantité maximale
     ("click", "purchase"),               # achat…
     ("click", "confirm"),                # … à confirmer
+    ("dismiss", "rewards_close"),        # fenêtre « Rewards » : clic dans une zone vide
     ("key", "esc"),
     ("key", "esc"),
     ("bait_dialog", "bait_slot_empty"),  # de nouveau « Switch Bait »…
@@ -1353,6 +1357,26 @@ class Restocker:
         sleep(human.reaction())
         log.info("  clic sur la case d'appât")
         click_box(click_area("bait_slot_empty", box))
+
+    def dismiss_popup(self, name: str) -> None:
+        """Ferme une fenêtre du type « Rewards » en cliquant dans une zone vide."""
+        try:
+            hint = self.wait_for_button(name, timeout=4.0, quiet=True)
+        except RestockFailed:
+            log.info("  pas de fenêtre « Rewards » à fermer")
+            return
+        x, y, w, h = hint
+        empty_area = (x + w // 6, int(y - 2.6 * h), w * 2 // 3, int(1.4 * h))
+        for _ in range(3):                      # au plus 3 essais
+            sleep(human.reaction())
+            log.info("  clic dans une zone vide (fermeture de « Rewards »)")
+            click_box(empty_area)
+            deadline = time.perf_counter() + 2.0
+            while time.perf_counter() < deadline:
+                sleep(0.15)
+                if not self.buttons[name].detect(grab(search_region())):
+                    return
+        raise RestockFailed("la fenêtre « Rewards » ne se ferme pas")
 
     def wait_for_button(self, name: str, timeout: Optional[float] = None,
                         avoid: Sequence[Region] = (), quiet: bool = False) -> Region:
@@ -1427,6 +1451,9 @@ class Restocker:
                 if action == "bait_dialog":
                     self.open_bait_dialog()
                     continue
+                if action == "dismiss":
+                    self.dismiss_popup(value)
+                    continue
                 before = clicked.get(value, [])
                 if action == "optional":
                     try:
@@ -1449,7 +1476,12 @@ class Restocker:
                     tap("esc", self.cfg.action_press_duration)
             raise
         sleep(human.within((0.8, 1.5)))
-        log.info("Appâts rachetés, reprise de la pêche.")
+        if self.bait_missing():
+            # Toujours « Not Selected » : l'appât acheté n'a pas été équipé.
+            self._save_failure("bait_slot_empty", grab(search_region()),
+                               self.buttons["bait_slot_empty"])
+            raise RestockFailed("appâts achetés mais pas équipés (case toujours vide)")
+        log.info("Appâts achetés et équipés, reprise de la pêche.")
 
 
 def fishing_prompt_detector(cfg: Config) -> Optional[BannerDetector]:

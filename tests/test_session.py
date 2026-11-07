@@ -377,13 +377,14 @@ class FakeShop:
     # - après « Switch », le panneau propose « Start Fishing ».
     CLICKS = {"slot_empty": "purchase1",
               "purchase1": "universal_bait", "universal_bait": "max_quantity",
-              "max_quantity": "purchase2", "purchase2": "confirm", "confirm": "bought",
+              "max_quantity": "purchase2", "purchase2": "confirm", "confirm": "rewards",
               "switch": "start_fishing", "start_fishing": "equipped"}
     KEYS = {("idle", "f"): "equip_banner", ("equip_banner", "e"): "purchase1",
             ("bought", "esc"): "bought_esc", ("bought_esc", "esc"): "fishing_mode",
             ("fishing_mode", "e"): "switch"}
     IMAGE = {"slot_empty": "bait_slot_empty",
-             "purchase1": "purchase", "purchase2": "purchase"}
+             "purchase1": "purchase", "purchase2": "purchase",
+             "rewards": "rewards_close"}
 
     def __init__(self, ghost_purchase=False):
         self.screen = "idle"
@@ -416,6 +417,12 @@ class FakeShop:
         bx, by, bw, bh = self.button_box
         self.clicks.append(self.screen)
         self.events.append("clic " + self.screen)
+        if self.screen == "rewards":
+            # « Press empty area to close » : seul un clic hors du texte, au-dessus
+            # (zone vide), ferme la fenêtre. Échap n'a aucun effet.
+            if cy < by:
+                self.screen = "bought"
+            return
         if self.screen not in self.CLICKS:
             return             # rien de cliquable sur cet écran
         if self.IMAGE.get(self.screen) == "bait_slot_empty":
@@ -492,7 +499,8 @@ class PauseKeyTest(unittest.TestCase):
         self.assertEqual(hook._held_keys, set())
 
 
-@unittest.skipUnless(PREPARATIONS.exists(), "capture de référence absente")
+@unittest.skipUnless(PREPARATIONS.exists() and (ROOT / "templates" / "originals" / "rewards.jpg").exists(),
+                     "captures de référence absentes")
 class RealScreenshotTest(unittest.TestCase):
     """Sur une vraie capture du panneau « Fishing Preparations » (07/11) : la case
     vide et « Start Fishing » sont reconnues, aucun autre bouton ne l'est."""
@@ -505,11 +513,25 @@ class RealScreenshotTest(unittest.TestCase):
         # L'invite « Fishing » n'est pas sur ce panneau : pas de F en trop.
         self.assertFalse(hook.fishing_prompt_detector(hook.Config()).detect(img))
 
+    def test_rewards_popup_after_confirm(self):
+        """Vraie capture de la fenêtre « Rewards » (07/11, 16:59) : seul le texte
+        « Press empty area to close » est reconnu, et la zone cliquée pour la
+        fermer est hors de la fenêtre (vide), au-dessus du texte."""
+        img = cv2.imread(str(ROOT / "templates" / "originals" / "rewards.jpg"))
+        restocker = hook.Restocker(hook.Config())
+        found = {name for name, det in restocker.buttons.items() if det.detect(img)}
+        self.assertEqual(found, {"rewards_close"})
+        _, (x, y, w, h) = restocker.buttons["rewards_close"].locate(img)
+        popup_bottom = 1000          # bas de la fenêtre « Rewards » sur cette capture
+        click_top = int(y - 2.6 * h)
+        self.assertGreater(click_top, popup_bottom)
+        self.assertLess(click_top + int(1.4 * h), y)   # au-dessus du texte
+
 
 @unittest.skipUnless(RESTOCK_DIR.is_dir() and EQUIP_BANNER.exists(), "templates absents")
 class RestockTest(unittest.TestCase):
     EXPECTED_CLICKS = ["slot_empty", "purchase1", "universal_bait", "max_quantity",
-                       "purchase2", "confirm", "switch", "start_fishing"]
+                       "purchase2", "confirm", "rewards", "switch", "start_fishing"]
 
     def setUp(self):
         self.shop = FakeShop()
@@ -554,7 +576,7 @@ class RestockTest(unittest.TestCase):
         self.cycle()
         events = self.shop.events
         i = events.index("clic purchase2")
-        self.assertEqual(events[i + 1:i + 4], ["clic confirm", "esc", "esc"])
+        self.assertEqual(events[i + 1:i + 5], ["clic confirm", "clic rewards", "esc", "esc"])
 
     def test_first_purchase_still_visible_behind_shop(self):
         """Bug « bloqué après double chevrons » : le 1er Purchase reste affiché
@@ -567,7 +589,8 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(self.shop.screen, "equipped")
         events = self.shop.events
         i = events.index("clic max_quantity")
-        self.assertEqual(events[i + 1:i + 5], ["clic purchase2", "clic confirm", "esc", "esc"])
+        self.assertEqual(events[i + 1:i + 6],
+                         ["clic purchase2", "clic confirm", "clic rewards", "esc", "esc"])
 
     def test_purchase_failure_still_escapes_twice(self):
         self.shop.CLICKS = dict(FakeShop.CLICKS, max_quantity="nothing")  # Purchase n'apparaît pas
@@ -626,6 +649,15 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(record.outcome, "restock")
         self.assertEqual(self.shop.keys[0], "f")
         self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
+
+    def test_bought_but_not_equipped_is_reported(self):
+        """Après Switch, la case est toujours vide : le bot ne repart pas pêcher
+        comme si de rien n'était, il signale l'échec."""
+        self.shop.CLICKS = dict(FakeShop.CLICKS, switch="slot_empty")
+        self.shop.screen = "slot_empty"
+        with self.assertRaises(hook.BlockedStop) as ctx:
+            self.cycle()
+        self.assertIn("pas équipés", str(ctx.exception))
 
     def test_own_escape_is_not_a_stop_request(self):
         hook._ignore_escape_until = 0.0

@@ -89,9 +89,13 @@ fishing. » déclenche la même chose.
 1. ouverture de la fenêtre **Switch Bait**, puis clic sur **Purchase** ;
 2. clic sur **Universal Bait** (celui à 5 coquillages), sur le **double chevron** (quantité
    maximale), sur **Purchase**, puis sur **Confirm** ;
-3. `Échap` **deux fois** (toujours deux, juste après l'achat confirmé) ;
-4. nouvelle ouverture de **Switch Bait**, puis clic sur **Switch** pour équiper l'appât ;
-5. clic sur **Start Fishing** si le panneau « Fishing Preparations » est encore affiché.
+3. fermeture de la fenêtre **Rewards** par un clic dans une zone vide (elle ne se ferme pas
+   avec `Échap`) ;
+4. `Échap` **deux fois** ;
+5. nouvelle ouverture de **Switch Bait**, puis clic sur **Switch** pour **équiper** l'appât ;
+6. clic sur **Start Fishing** si le panneau « Fishing Preparations » est encore affiché ;
+7. vérification : si la case affiche encore « Not Selected », l'appât n'a pas été équipé, et
+   le bot s'arrête avec une alerte et une capture dans `debug/`.
 
 Pour ouvrir **Switch Bait**, le bot clique au centre de la case d'appât vide si le panneau
 « Fishing Preparations » est affiché. Sinon, en mode pêche, il appuie sur `E`, qui ouvre
