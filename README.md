@@ -15,11 +15,21 @@ pip install -r requirements.txt
 
 ## Utilisation
 
-Aucun réglage préalable n'est nécessaire : lancez le bot, puis donnez le focus à la fenêtre
-du jeu dans les 3 secondes.
+Aucun réglage préalable n'est nécessaire : lancez le bot, puis **cliquez dans la fenêtre du
+jeu**. Le bot démarre une seconde après et ne travaille que dans cette fenêtre :
+
+- la bannière et la jauge ne sont cherchées qu'à l'intérieur (une image visible dans un autre
+  programme ne peut pas déclencher le bot) ;
+- si le jeu quitte le premier plan, le bot se met en pause et n'envoie aucune touche.
+
+> **Si F n'a aucun effet en jeu** : lancez le terminal **en administrateur**. Windows bloque,
+> sans aucune erreur, les touches envoyées à un jeu lancé en administrateur (fréquent avec
+> les anti-triche) depuis un programme qui ne l'est pas. Le bot affiche un avertissement
+> quand il détecte ce cas.
 
 ```bash
 python hook.py                       # boucle infinie
+python hook.py --window "Nom du jeu" # cible la fenêtre par son titre
 python hook.py --cycles 10 -v        # 10 cycles, logs détaillés
 python hook.py --invert              # si Q/D agissent dans le sens opposé
 python hook.py --input pyautogui     # touches via PyAutoGUI au lieu des scancodes

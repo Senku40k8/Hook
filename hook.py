@@ -96,10 +96,11 @@ class Config:
     # --- Temporisations (secondes, bornes min/max des tirages aléatoires) ---
     start_delay: Range = (0.5, 1.5)         # après le premier F
     reaction_delay: Range = (0.12, 0.30)    # entre la bannière et le second F
+    action_press_duration: Range = (0.08, 0.15)  # durée d'appui sur F (lu à chaque image par le jeu)
     press_duration: Range = (0.03, 0.08)    # durée d'une pression Q/D
     press_cooldown: Range = (0.04, 0.10)    # intervalle min. entre deux corrections
     cycle_pause: Range = (3.0, 4.5)         # fin de cycle
-    startup_countdown: float = 3.0          # temps pour remettre le focus sur la fenêtre
+    startup_countdown: float = 1.0          # délai après l'arrivée du jeu au premier plan
     setup_countdown: float = 10.0           # temps pour afficher la jauge avant la capture --setup
 
     # --- Délais de garde ----------------------------------------------------
@@ -289,12 +290,157 @@ keyboard = PyAutoGuiKeyboard()
 
 
 def tap(key: str, duration: Range) -> None:
-    """Pression courte d'une touche, durée de maintien aléatoire."""
+    """Pression courte d'une touche, durée de maintien aléatoire.
+
+    N'envoie rien tant que la fenêtre du jeu n'est pas au premier plan."""
+    wait_for_focus()
     keyboard.down(key)
     try:
         sleep(rand(duration))
     finally:
         keyboard.up(key)  # relâche la touche même en cas d'interruption
+
+
+# --------------------------------------------------------------------------- #
+# Fenêtre du jeu
+# --------------------------------------------------------------------------- #
+class GameWindow:
+    """Fenêtre cible (Windows) : premier plan, zone client, privilèges.
+
+    Les recherches d'images sont limitées à cette fenêtre : une bannière
+    visible ailleurs (éditeur, navigateur…) ne peut donc pas être détectée.
+    """
+
+    def __init__(self, hwnd: int):
+        self.hwnd = hwnd
+        self.title = self.window_title(hwnd)
+
+    @staticmethod
+    def _user32():
+        u32 = ctypes.windll.user32
+        u32.GetForegroundWindow.restype = wintypes.HWND
+        return u32
+
+    @classmethod
+    def foreground_hwnd(cls) -> int:
+        return cls._user32().GetForegroundWindow() or 0
+
+    @classmethod
+    def window_title(cls, hwnd: int) -> str:
+        u32 = cls._user32()
+        length = u32.GetWindowTextLengthW(wintypes.HWND(hwnd))
+        buf = ctypes.create_unicode_buffer(length + 1)
+        u32.GetWindowTextW(wintypes.HWND(hwnd), buf, length + 1)
+        return buf.value
+
+    @classmethod
+    def find(cls, title_part: str) -> Optional["GameWindow"]:
+        """Première fenêtre visible dont le titre contient title_part (sans casse)."""
+        u32 = cls._user32()
+        found: list[int] = []
+        proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def callback(hwnd, _):
+            if u32.IsWindowVisible(hwnd) and title_part.lower() in cls.window_title(hwnd).lower():
+                found.append(hwnd)
+                return False
+            return True
+
+        u32.EnumWindows(proc(callback), 0)
+        return cls(found[0]) if found else None
+
+    def is_foreground(self) -> bool:
+        return self.foreground_hwnd() == self.hwnd
+
+    def client_region(self) -> Optional[Region]:
+        """Zone client (sans bordures ni barre de titre) en coordonnées écran."""
+        u32 = self._user32()
+        hwnd = wintypes.HWND(self.hwnd)
+        if u32.IsIconic(hwnd):
+            return None
+        rect = wintypes.RECT()
+        origin = wintypes.POINT(0, 0)
+        if not u32.GetClientRect(hwnd, ctypes.byref(rect)) or \
+                not u32.ClientToScreen(hwnd, ctypes.byref(origin)):
+            return None
+        if rect.right <= 0 or rect.bottom <= 0:
+            return None
+        return origin.x, origin.y, rect.right, rect.bottom
+
+    def is_elevated(self) -> Optional[bool]:
+        """True si le jeu tourne en administrateur, None si impossible à savoir."""
+        pid = wintypes.DWORD()
+        self._user32().GetWindowThreadProcessId(wintypes.HWND(self.hwnd), ctypes.byref(pid))
+        k32, adv = ctypes.windll.kernel32, ctypes.windll.advapi32
+        k32.OpenProcess.restype = wintypes.HANDLE
+        process = k32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not process:
+            return None
+        token = wintypes.HANDLE()
+        try:
+            if not adv.OpenProcessToken(wintypes.HANDLE(process), 0x0008, ctypes.byref(token)):
+                return None  # refus d'accès : processus protégé ou élevé
+            elevation, size = wintypes.DWORD(), wintypes.DWORD()
+            if not adv.GetTokenInformation(token, 20, ctypes.byref(elevation), 4, ctypes.byref(size)):
+                return None  # 20 = TokenElevation
+            return bool(elevation.value)
+        finally:
+            if token:
+                k32.CloseHandle(token)
+            k32.CloseHandle(wintypes.HANDLE(process))
+
+
+def running_as_admin() -> bool:
+    return sys.platform == "win32" and bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+# Fenêtre du jeu (définie dans main() ; None = pas de restriction).
+target: Optional[GameWindow] = None
+
+
+def wait_for_focus() -> None:
+    """Met le bot en pause tant que la fenêtre du jeu n'est pas au premier plan."""
+    if target is None or target.is_foreground():
+        return
+    log.warning("« %s » n'est plus au premier plan : bot en pause.", target.title)
+    while not target.is_foreground():
+        sleep(0.2)
+    log.info("Jeu revenu au premier plan, reprise.")
+    sleep(0.5)
+
+
+def pick_target(window_title: Optional[str], settle: float) -> GameWindow:
+    """Fenêtre du jeu : par titre, sinon la prochaine fenêtre cliquée."""
+    if window_title:
+        window = GameWindow.find(window_title)
+        if window is None:
+            raise ValueError(f"Aucune fenêtre visible dont le titre contient « {window_title} ».")
+        log.info("Fenêtre du jeu : « %s ». Mettez-la au premier plan.", window.title)
+        while not window.is_foreground():
+            sleep(0.1)
+    else:
+        start = GameWindow.foreground_hwnd()
+        log.info("Cliquez dans la fenêtre du jeu pour démarrer…")
+        while GameWindow.foreground_hwnd() in (0, start):
+            sleep(0.1)
+        window = GameWindow(GameWindow.foreground_hwnd())
+        log.info("Fenêtre du jeu : « %s ».", window.title)
+    sleep(settle)
+    return window
+
+
+def warn_if_input_blocked(window: GameWindow) -> None:
+    """Windows ignore sans erreur les touches envoyées à un jeu lancé en
+    administrateur depuis un terminal qui ne l'est pas."""
+    if running_as_admin():
+        return
+    elevated = window.is_elevated()
+    if elevated:
+        log.warning("Le jeu tourne en administrateur mais pas ce terminal : Windows "
+                    "bloquera les touches. Relancez le terminal en administrateur.")
+    elif elevated is None:
+        log.warning("Privilèges du jeu inconnus (processus protégé ?). Si F n'a aucun "
+                    "effet, relancez le terminal en administrateur.")
 
 
 # --------------------------------------------------------------------------- #
@@ -315,6 +461,15 @@ def full_screen_region() -> Region:
     """Zone couvrant l'écran principal."""
     mon = _sct().monitors[1]
     return mon["left"], mon["top"], mon["width"], mon["height"]
+
+
+def search_region() -> Region:
+    """Zone de recherche quand aucune zone n'est verrouillée : la fenêtre du jeu."""
+    if target is not None:
+        region = target.client_region()
+        if region is not None:
+            return region
+    return full_screen_region()
 
 
 def grab(region: Optional[Region] = None) -> np.ndarray:
@@ -499,7 +654,7 @@ def banner_lock_region(match: Region, frame_region: Region) -> Region:
     left, top = frame_region[0] + mx, frame_region[1] + my
     pad_x, pad_y = int(mw * 0.15), mh
     return clip_region(left - pad_x, top - pad_y, left + mw + pad_x, top + mh + pad_y,
-                       full_screen_region())
+                       frame_region)
 
 
 def gauge_lock_region(cfg: Config, state: GaugeState, frame_region: Region) -> Region:
@@ -510,7 +665,7 @@ def gauge_lock_region(cfg: Config, state: GaugeState, frame_region: Region) -> R
     cy = frame_region[1] + (state.green_top + state.green_bottom) // 2
     half_w = max(int(width * cfg.gauge_lock_width_factor), cfg.gauge_lock_min_half_width)
     half_h = (state.green_bottom - state.green_top) // 2 + cfg.gauge_lock_vertical_pad
-    return clip_region(cx - half_w, cy - half_h, cx + half_w, cy + half_h, full_screen_region())
+    return clip_region(cx - half_w, cy - half_h, cx + half_w, cy + half_h, frame_region)
 
 
 def wait_for_banner(cfg: Config, detector: BannerDetector) -> bool:
@@ -518,7 +673,8 @@ def wait_for_banner(cfg: Config, detector: BannerDetector) -> bool:
     deadline = time.perf_counter() + cfg.banner_timeout
     while time.perf_counter() < deadline:
         check_stop()
-        region = cfg.banner_region or full_screen_region()
+        wait_for_focus()
+        region = cfg.banner_region or search_region()
         score, box = detector.locate(grab(region))
         if score >= detector.threshold:
             log.info("Bannière détectée (score %.2f).", score)
@@ -536,8 +692,9 @@ def wait_for_gauge(cfg: Config, detector: GaugeDetector) -> bool:
     deadline = time.perf_counter() + cfg.gauge_appear_timeout
     while time.perf_counter() < deadline:
         check_stop()
+        wait_for_focus()
         searching = cfg.gauge_region is None
-        region = cfg.gauge_region or full_screen_region()
+        region = cfg.gauge_region or search_region()
         state = detector.detect(grab(region), search=searching)
         if state is not None:
             log.info("Jauge détectée, début du suivi.")
@@ -564,7 +721,9 @@ def track_gauge(cfg: Config, detector: GaugeDetector) -> None:
             log.warning("Durée max. de suivi atteinte, arrêt du suivi.")
             return
 
-        state = detector.detect(grab(cfg.gauge_region), search=cfg.gauge_region is None)
+        wait_for_focus()
+        state = detector.detect(grab(cfg.gauge_region or search_region()),
+                                search=cfg.gauge_region is None)
         frames += 1
         if state is None:
             lost_since = lost_since or now
@@ -580,7 +739,7 @@ def track_gauge(cfg: Config, detector: GaugeDetector) -> None:
 def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector) -> None:
     # Étape 1 : lancement
     log.info("Étape 1 : appui sur %s", cfg.key_action.upper())
-    tap(cfg.key_action, cfg.press_duration)
+    tap(cfg.key_action, cfg.action_press_duration)
     sleep(rand(cfg.start_delay))
 
     # Étape 2 : bannière -> second appui
@@ -588,7 +747,7 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector) -> None
         log.warning("Bannière non détectée après %.0f s, cycle abandonné.", cfg.banner_timeout)
         return
     sleep(rand(cfg.reaction_delay))
-    tap(cfg.key_action, cfg.press_duration)
+    tap(cfg.key_action, cfg.action_press_duration)
 
     # Étape 3 : régulation de la jauge
     if not wait_for_gauge(cfg, gauge):
@@ -729,6 +888,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--banner-region", type=int, nargs=4, metavar=("L", "T", "W", "H"))
     p.add_argument("--gauge-region", type=int, nargs=4, metavar=("L", "T", "W", "H"))
     p.add_argument("--template", type=Path, help="image de la bannière")
+    p.add_argument("--window", metavar="TITRE",
+                   help="partie du titre de la fenêtre du jeu (sinon : fenêtre cliquée au démarrage)")
     p.add_argument("--invert", action="store_true", help="inverse Q et D")
     p.add_argument("--input", choices=("auto", "scancode", "pyautogui"),
                    help="méthode d'envoi des touches (auto = scancode sous Windows)")
@@ -758,7 +919,7 @@ def build_config(args: argparse.Namespace) -> Config:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    global keyboard
+    global keyboard, target
     args = parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -777,10 +938,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             calibrate(cfg, Path("debug"))
             return 0
 
-        if cfg.gauge_region is None or cfg.banner_region is None:
-            log.info("Zones non mémorisées : recherche sur tout l'écran au premier cycle, "
-                     "puis verrouillage automatique.")
-
         keyboard = make_keyboard(cfg.input_backend)
         keyboard.prepare((cfg.key_action, cfg.key_left, cfg.key_right))
         log.info("Envoi des touches : %s", keyboard.name)
@@ -788,9 +945,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         banner = BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)
         gauge = GaugeDetector(cfg)
 
-        log.info("Démarrage dans %.0f s — placez le focus sur la fenêtre cible. "
-                 "Échap ou souris dans un coin pour arrêter.", cfg.startup_countdown)
-        sleep(cfg.startup_countdown)
+        log.info("Échap ou souris dans un coin de l'écran pour arrêter.")
+        if sys.platform == "win32":
+            target = pick_target(args.window, cfg.startup_countdown)
+            warn_if_input_blocked(target)
+        else:
+            sleep(cfg.startup_countdown)
+
+        if cfg.gauge_region is None or cfg.banner_region is None:
+            log.info("Zones non mémorisées : recherche dans la fenêtre du jeu au premier "
+                     "cycle, puis verrouillage automatique.")
 
         cycle = 0
         while args.cycles == 0 or cycle < args.cycles:

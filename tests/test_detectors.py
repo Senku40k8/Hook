@@ -184,6 +184,25 @@ class SetupHelpersTest(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows uniquement")
+class GameWindowTest(unittest.TestCase):
+    def test_foreground_window_has_client_region(self):
+        hwnd = hook.GameWindow.foreground_hwnd()
+        if not hwnd:
+            self.skipTest("aucune fenêtre au premier plan")
+        window = hook.GameWindow(hwnd)
+        self.assertTrue(window.is_foreground())
+        region = window.client_region()
+        if region is not None:
+            self.assertGreater(region[2], 0)
+            self.assertGreater(region[3], 0)
+        self.assertIn(window.is_elevated(), (True, False, None))
+
+    def test_no_target_means_full_screen(self):
+        self.assertIsNone(hook.target)
+        self.assertEqual(hook.search_region(), hook.full_screen_region())
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows uniquement")
 class ScancodeKeyboardTest(unittest.TestCase):
     def test_scancodes_resolved(self):
         kb = hook.ScancodeKeyboard()
