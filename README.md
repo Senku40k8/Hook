@@ -86,7 +86,13 @@ Activé par défaut (`--robotic` pour le désactiver) :
 équipe des appâts tout seul, puis reprend la pêche. La bannière « Equip bait before
 fishing. » déclenche la même chose.
 
-1. ouverture de la fenêtre **Switch Bait**, puis clic sur **Purchase** ;
+Le bot ouvre d'abord la fenêtre **Switch Bait** et regarde ce qu'elle propose :
+
+- **Cancel / Switch** : il reste des appâts, non équipés. Le bot clique sur **Switch**, puis
+  sur **Start Fishing** si besoin. Il n'achète rien.
+- **Cancel / Purchase** : il n'y a plus d'appâts, et le bot les achète puis les équipe :
+
+1. clic sur **Purchase** ;
 2. clic sur **Universal Bait** (celui à 5 coquillages), sur le **double chevron** (quantité
    maximale), sur **Purchase**, puis sur **Confirm** ;
 3. fermeture de la fenêtre **Rewards** par un clic dans une zone vide (elle ne se ferme pas

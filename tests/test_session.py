@@ -513,6 +513,20 @@ class RealScreenshotTest(unittest.TestCase):
         # L'invite « Fishing » n'est pas sur ce panneau : pas de F en trop.
         self.assertFalse(hook.fishing_prompt_detector(hook.Config()).detect(img))
 
+    def test_switch_bait_with_bait_in_stock(self):
+        """Vraie capture du 07/11 à 17:07 : « Switch Bait » avec 99 appâts en stock.
+        Le bot doit choisir « Switch » (le bouton à droite), pas « Purchase »."""
+        img = cv2.imread(str(ROOT / "templates" / "originals" / "switch bait stock.jpg"))
+        restocker = hook.Restocker(hook.Config())
+        self.assertTrue(restocker.buttons["switch"].detect(img))
+        self.assertFalse(restocker.buttons["purchase"].detect(img))
+        saved = hook.grab
+        hook.grab = lambda region=None: img
+        try:
+            self.assertEqual(restocker.wait_for_any(("switch", "purchase"), timeout=2.0), "switch")
+        finally:
+            hook.grab = saved
+
     def test_rewards_popup_after_confirm(self):
         """Vraie capture de la fenêtre « Rewards » (07/11, 16:59) : seul le texte
         « Press empty area to close » est reconnu, et la zone cliquée pour la
@@ -649,6 +663,27 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(record.outcome, "restock")
         self.assertEqual(self.shop.keys[0], "f")
         self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
+
+    def test_bait_in_stock_is_equipped_without_buying(self):
+        """Bug du 07/11 à 17:07 : 99 appâts en stock mais non équipés. « Switch
+        Bait » affiche Cancel / Switch (pas Purchase) : le bot doit cliquer
+        Switch, sans rien acheter."""
+        self.shop.CLICKS = dict(FakeShop.CLICKS, slot_empty="switch")
+        self.shop.screen = "slot_empty"
+        record = self.cycle()
+        self.assertEqual(record.outcome, "restock")
+        self.assertEqual(self.shop.clicks, ["slot_empty", "switch", "start_fishing"])
+        self.assertEqual(self.shop.keys, [])                # ni achat, ni Échap
+        self.assertEqual(self.shop.screen, "equipped")
+
+    def test_bait_in_stock_from_fishing_mode_with_e(self):
+        """En mode pêche (pas de panneau) : E ouvre « Switch Bait », puis Switch."""
+        self.shop.KEYS = {**FakeShop.KEYS, ("fishing_mode", "e"): "switch"}
+        self.shop.screen = "fishing_mode"
+        _, restocker = hook.restock_tools(self.cfg)
+        restocker.run()
+        self.assertEqual(self.shop.keys, ["e"])
+        self.assertEqual(self.shop.clicks, ["switch", "start_fishing"])
 
     def test_bought_but_not_equipped_is_reported(self):
         """Après Switch, la case est toujours vide : le bot ne repart pas pêcher

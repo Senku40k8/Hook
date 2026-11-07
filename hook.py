@@ -155,7 +155,8 @@ class Config:
 
     # --- Réapprovisionnement en appâts --------------------------------------
     # Déclenché avant chaque cycle si la case d'appât est vide (« Not Selected »),
-    # ou par la bannière « Equip bait before fishing ». Étapes : voir RESTOCK_STEPS.
+    # ou par la bannière « Equip bait before fishing ». Étapes : voir EQUIP_STEPS
+    # (appâts en stock) et BUY_STEPS (plus d'appâts).
     # Invite « Fishing » du point de pêche : F pour s'installer (au lancement ou
     # si le bot est sorti du mode pêche).
     fishing_prompt_template: Path = TEMPLATES_DIR / "fishing_prompt.png"
@@ -1286,8 +1287,15 @@ def wait_for_result(cfg: Config, results: MessageDetector) -> str:
 #   "dismiss"     fenêtre qui se ferme en cliquant dans une zone vide (Échap
 #                 ne la ferme pas) : repérée par son texte « Press empty area
 #                 to close », on clique juste au-dessus, hors de la fenêtre
-RESTOCK_STEPS: Tuple[Tuple[str, str], ...] = (
-    ("bait_dialog", "bait_slot_empty"),  # fenêtre « Switch Bait »
+#
+# La fenêtre « Switch Bait » (ouverte par la case d'appât ou E) affiche :
+#   - « Cancel / Switch »   s'il reste des appâts : on équipe directement ;
+#   - « Cancel / Purchase » s'il n'en reste plus  : on achète, puis on équipe.
+EQUIP_STEPS: Tuple[Tuple[str, str], ...] = (
+    ("click", "switch"),                 # équipe l'appât en stock
+    ("optional", "start_fishing"),       # panneau « Fishing Preparations » encore ouvert
+)
+BUY_STEPS: Tuple[Tuple[str, str], ...] = (
     ("click", "purchase"),               # ouvre l'achat d'appâts
     ("click", "universal_bait"),         # Universal Bait à 5 coquillages
     ("click", "max_quantity"),           # double chevron : quantité maximale
@@ -1297,9 +1305,9 @@ RESTOCK_STEPS: Tuple[Tuple[str, str], ...] = (
     ("key", "esc"),
     ("key", "esc"),
     ("bait_dialog", "bait_slot_empty"),  # de nouveau « Switch Bait »…
-    ("click", "switch"),                 # … pour équiper l'appât acheté
-    ("optional", "start_fishing"),       # panneau « Fishing Preparations » encore ouvert
-)
+) + EQUIP_STEPS                          # … puis Switch pour équiper l'appât acheté
+RESTOCK_BUTTONS = sorted({name for action, name in BUY_STEPS if action != "key"}
+                         | {"bait_slot_empty"})
 ICON_TEMPLATES: set = set()     # modèles comparés par contours (icônes à couleur variable)
 # Seuils plus stricts : la case vide ne doit jamais être confondue avec une case
 # équipée (sinon achat d'appâts à chaque cycle).
@@ -1327,18 +1335,42 @@ class RestockFailed(Exception):
 
 
 class Restocker:
-    """Rachète des appâts en suivant RESTOCK_STEPS, en vérifiant chaque bouton."""
+    """Équipe un appât (et l'achète d'abord s'il n'en reste plus), en vérifiant
+    chaque bouton avant de cliquer."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.buttons: Dict[str, BannerDetector] = {}
-        for action, name in RESTOCK_STEPS:
-            if action != "key":
-                icon = name in ICON_TEMPLATES
-                threshold = TEMPLATE_THRESHOLDS.get(
-                    name, cfg.restock_icon_threshold if icon else cfg.restock_threshold)
-                self.buttons[name] = BannerDetector(
-                    cfg.restock_dir / f"{name}.png", threshold, cfg.banner_scales, edges=icon)
+        for name in RESTOCK_BUTTONS:
+            icon = name in ICON_TEMPLATES
+            threshold = TEMPLATE_THRESHOLDS.get(
+                name, cfg.restock_icon_threshold if icon else cfg.restock_threshold)
+            self.buttons[name] = BannerDetector(
+                cfg.restock_dir / f"{name}.png", threshold, cfg.banner_scales, edges=icon)
+
+    def wait_for_any(self, names: Sequence[str], timeout: Optional[float] = None) -> str:
+        """Attend que l'un des boutons soit visible et immobile ; renvoie son nom."""
+        deadline = time.perf_counter() + (timeout or self.cfg.restock_step_timeout)
+        previous: Dict[str, Optional[Region]] = {name: None for name in names}
+        frame = None
+        while time.perf_counter() < deadline:
+            check_stop()
+            wait_for_focus()
+            region = search_region()
+            frame = grab(region)
+            for name in names:
+                score, box = self.buttons[name].locate(frame)
+                if score < self.buttons[name].threshold or box is None:
+                    previous[name] = None
+                    continue
+                last = previous[name]
+                if last is not None and abs(last[0] - box[0]) <= 3 and abs(last[1] - box[1]) <= 3:
+                    return name
+                previous[name] = box
+            sleep(0.08)
+        for name in names:
+            self._save_failure(name, frame, self.buttons[name])
+        raise RestockFailed("ni « " + " » ni « ".join(names) + " » dans la fenêtre « Switch Bait »")
 
     def bait_missing(self) -> bool:
         """True si la case d'appât vide (« Not Selected ») est visible."""
@@ -1424,49 +1456,33 @@ class Restocker:
         raise RestockFailed(f"bouton « {name} » introuvable")
 
     def _save_failure(self, name: str, frame: Optional[np.ndarray],
-                      detector: BannerDetector) -> None:
-        """Capture d'écran pour comprendre pourquoi un bouton n'a pas été trouvé."""
+                      detector: BannerDetector, message: Optional[str] = None) -> None:
+        """Capture d'écran pour comprendre pourquoi une étape a échoué."""
         if frame is None:
             return
         try:
             out = Path("debug") / f"restock_{name}_{time.strftime('%H%M%S')}.png"
             out.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(out), frame)
-            log.warning("  « %s » introuvable (meilleur score %.2f, seuil %.2f). Capture : %s",
-                        name, detector.score(frame), detector.threshold, out)
+            if message:
+                log.warning("  %s Capture : %s", message, out)
+            else:
+                log.warning("  « %s » introuvable (meilleur score %.2f, seuil %.2f). Capture : %s",
+                            name, detector.score(frame), detector.threshold, out)
         except Exception:
             pass
 
     def run(self) -> None:
-        log.info("Réapprovisionnement en appâts…")
-        clicked: Dict[str, List[Region]] = {}
+        log.info("Aucun appât équipé : ouverture de « Switch Bait »…")
         try:
-            for action, value in RESTOCK_STEPS:
-                # Rythme humain : courte pause, parfois une hésitation.
-                sleep(human.within(self.cfg.restock_step_delay) + human.hesitation())
-                if action == "key":
-                    log.info("  touche %s", value.upper())
-                    tap(value, self.cfg.action_press_duration)
-                    continue
-                if action == "bait_dialog":
-                    self.open_bait_dialog()
-                    continue
-                if action == "dismiss":
-                    self.dismiss_popup(value)
-                    continue
-                before = clicked.get(value, [])
-                if action == "optional":
-                    try:
-                        box = self.wait_for_button(value, timeout=2.0, quiet=True)
-                    except RestockFailed:
-                        continue          # pas affiché : rien à faire
-                else:
-                    # Bouton déjà cliqué (2e « Purchase ») : surtout pas le même.
-                    box = self.wait_for_button(value, avoid=before)
-                clicked.setdefault(value, []).append(box)
-                sleep(human.reaction())         # temps de repérer le bouton apparu
-                log.info("  clic sur %s", value)
-                click_box(click_area(value, box))
+            sleep(human.within(self.cfg.restock_step_delay))
+            self.open_bait_dialog()
+            if self.wait_for_any(("switch", "purchase")) == "switch":
+                log.info("Appâts en stock : équipement direct.")
+                self._run_steps(EQUIP_STEPS)
+            else:
+                log.info("Plus d'appâts : achat d'Universal Bait puis équipement.")
+                self._run_steps(BUY_STEPS)
         except RestockFailed:
             # Referme les menus restés ouverts avant d'abandonner, mais seulement
             # si le jeu est au premier plan (sinon on attendrait indéfiniment).
@@ -1477,11 +1493,42 @@ class Restocker:
             raise
         sleep(human.within((0.8, 1.5)))
         if self.bait_missing():
-            # Toujours « Not Selected » : l'appât acheté n'a pas été équipé.
-            self._save_failure("bait_slot_empty", grab(search_region()),
-                               self.buttons["bait_slot_empty"])
-            raise RestockFailed("appâts achetés mais pas équipés (case toujours vide)")
-        log.info("Appâts achetés et équipés, reprise de la pêche.")
+            # Toujours « Not Selected » : l'appât n'a pas été équipé.
+            self._save_failure("not_equipped", grab(search_region()),
+                               self.buttons["bait_slot_empty"],
+                               "La case d'appât affiche toujours « Not Selected ».")
+            raise RestockFailed("appâts pas équipés (case toujours vide)")
+        log.info("Appât équipé, reprise de la pêche.")
+
+    def _run_steps(self, steps: Sequence[Tuple[str, str]]) -> None:
+        """Exécute une liste d'étapes (voir EQUIP_STEPS et BUY_STEPS)."""
+        clicked: Dict[str, List[Region]] = {}
+        for action, value in steps:
+            # Rythme humain : courte pause, parfois une hésitation.
+            sleep(human.within(self.cfg.restock_step_delay) + human.hesitation())
+            if action == "key":
+                log.info("  touche %s", value.upper())
+                tap(value, self.cfg.action_press_duration)
+                continue
+            if action == "bait_dialog":
+                self.open_bait_dialog()
+                continue
+            if action == "dismiss":
+                self.dismiss_popup(value)
+                continue
+            before = clicked.get(value, [])
+            if action == "optional":
+                try:
+                    box = self.wait_for_button(value, timeout=2.0, quiet=True)
+                except RestockFailed:
+                    continue              # pas affiché : rien à faire
+            else:
+                # Bouton déjà cliqué (2e « Purchase ») : surtout pas le même.
+                box = self.wait_for_button(value, avoid=before)
+            clicked.setdefault(value, []).append(box)
+            sleep(human.reaction())       # temps de repérer le bouton apparu
+            log.info("  clic sur %s", value)
+            click_box(click_area(value, box))
 
 
 def fishing_prompt_detector(cfg: Config) -> Optional[BannerDetector]:
