@@ -8,15 +8,22 @@ Cycle exécuté en boucle :
     3. Suivi en temps réel de la jauge (zone verte + indicateur jaune) :
        pressions courtes sur Q (gauche) / D (droite) pour garder l'indicateur
        dans la zone verte, jusqu'à la disparition de la jauge.
-    4. Pause aléatoire (3.0 s - 4.5 s) puis retour à l'étape 1.
+    4. Jauge disparue : résultat (réussite/échec) lu si possible, appui sur F.
+    5. Pause (au moins 3 s, parfois plus longue) puis retour à l'étape 1.
 
-Arrêt propre :
-    - Touche Échap (vérifiée en permanence, y compris pendant les pauses).
-    - Fail-safe PyAutoGUI : amener la souris dans un coin de l'écran.
-    - Ctrl+C dans le terminal.
+Comportement humain (module session.py) : temps de réaction réalistes, fatigue,
+petites imperfections, sessions de 20-45 min entrecoupées de pauses de 5-15 min.
+
+Contrôle :
+    - F8 : pause / reprise (le cycle repart de zéro à la reprise).
+    - Échap, souris dans un coin de l'écran ou Ctrl+C : arrêt.
+    - Arrêt automatique (avec alerte sonore) après plusieurs cycles ratés de
+      suite ou si un message de blocage (templates/stop/*.png) apparaît.
 
 Usage :
     python hook.py                    # lance la boucle (zones détectées automatiquement)
+    python hook.py --duration 2h      # s'arrête après 2 heures
+    python hook.py --max-fish 100     # s'arrête après 100 poissons
     python hook.py --cycles 5         # s'arrête après 5 cycles
     python hook.py --setup            # facultatif : réglage manuel des zones et couleurs
     python hook.py --calibrate        # capture + masques de debug pour vérifier le réglage
@@ -32,14 +39,19 @@ import logging
 import random
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import mss
 import numpy as np
 import pyautogui
+
+from session import (
+    CycleRecord, HumanConfig, Humanizer, SessionConfig, SessionPlanner, Stats,
+    format_duration, parse_duration,
+)
 
 log = logging.getLogger("hook")
 
@@ -48,6 +60,7 @@ HSV = Tuple[int, int, int]
 Range = Tuple[float, float]
 
 CONFIG_FILE = Path(__file__).with_name("hook_config.json")
+TEMPLATES_DIR = Path(__file__).with_name("templates")
 
 
 # --------------------------------------------------------------------------- #
@@ -101,7 +114,13 @@ class Config:
     deadzone_ratio: float = 0.15            # tolérance autour de la cible (fraction de la largeur verte)
     lead_time: float = 0.15                 # anticipation du mouvement de la zone verte (s)
     velocity_smoothing: float = 0.5         # lissage de la vitesse estimée (0..1)
-    press_gain: float = 0.30                # s d'appui par largeur verte d'écart
+    press_gain: float = 0.30                # s d'appui par largeur verte d'écart (avant apprentissage)
+    # Réglage automatique : vitesse de la ligne jaune (px/s d'appui) mesurée
+    # pendant le jeu, mémorisée dans hook_config.json.
+    line_speed: Optional[float] = None
+    line_speed_min_samples: int = 3         # mesures avant d'utiliser la vitesse apprise
+    correction_fraction: float = 0.8        # part de l'écart corrigée par un appui
+    auto_invert: bool = True                # inverse Q/D si la ligne part à l'opposé
 
     # --- Temporisations (secondes, bornes min/max des tirages aléatoires) ---
     start_delay: Range = (0.5, 1.5)         # après le premier F
@@ -120,12 +139,26 @@ class Config:
     gauge_max_duration: float = 120.0       # sécurité : durée max. du suivi
     scan_interval: float = 0.03             # pause entre deux captures en attente
 
+    # --- Résultat de la prise et blocages (templates facultatifs) ------------
+    # templates/result_success.png, templates/result_fail.png : messages de fin.
+    # templates/stop/*.png : messages qui arrêtent le bot (inventaire plein…).
+    templates_dir: Path = TEMPLATES_DIR
+    message_threshold: float = 0.80
+    result_timeout: float = 1.5             # attente max. du message de résultat (s)
+    max_consecutive_failures: int = 3       # arrêt après N cycles ratés de suite
+
+    # --- Session, comportement humain, statistiques -------------------------
+    human: HumanConfig = field(default_factory=HumanConfig)
+    session: SessionConfig = field(default_factory=SessionConfig)
+    stats_path: Optional[Path] = Path(__file__).with_name("logs") / "catches.csv"
+    pause_vk: int = 0x77                    # F8 : pause / reprise
+
 
 # Champs enregistrés dans hook_config.json (réglages propres à la machine).
 PERSISTED_FIELDS = (
     "banner_region", "gauge_region",
     "green_lower", "green_upper", "yellow_lower", "yellow_upper",
-    "invert_controls", "input_backend", "window_title",
+    "invert_controls", "input_backend", "window_title", "line_speed",
 )
 
 
@@ -147,20 +180,58 @@ def save_config_file(cfg: Config, path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Arrêt propre : Échap + fail-safe PyAutoGUI
+# Arrêt (Échap, fail-safe), pause (F8) et alertes
 # --------------------------------------------------------------------------- #
 class StopRequested(Exception):
     """Levée quand l'utilisateur demande l'arrêt (Échap)."""
 
 
+class BlockedStop(StopRequested):
+    """Arrêt automatique sur blocage (cycles ratés, message de blocage)."""
+
+
+class ResumeRequested(Exception):
+    """Levée à la reprise après une pause F8 : le cycle repart de zéro."""
+
+
 _VK_ESCAPE = 0x1B
+PAUSE_VK = 0x77                     # remplacé par cfg.pause_vk dans main()
+_pause_key_was_down = False
+
+
+def _key_is_down(vk: int) -> bool:
+    """Lit l'état d'une touche via l'API Win32 (aucune dépendance externe)."""
+    if sys.platform != "win32":
+        return False
+    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
 
 def _escape_pressed() -> bool:
-    """Lit l'état de la touche Échap via l'API Win32 (aucune dépendance externe)."""
-    if sys.platform != "win32":
-        return False
-    return bool(ctypes.windll.user32.GetAsyncKeyState(_VK_ESCAPE) & 0x8000)
+    return _key_is_down(_VK_ESCAPE)
+
+
+def _pause_toggled() -> bool:
+    """True au moment où la touche de pause est enfoncée (front montant)."""
+    global _pause_key_was_down
+    down = _key_is_down(PAUSE_VK)
+    toggled = down and not _pause_key_was_down
+    _pause_key_was_down = down
+    return toggled
+
+
+def _pause_loop() -> None:
+    """Pause F8 : relâche les touches, attend F8 (reprise) ou Échap (arrêt)."""
+    release_all_keys()
+    log.info("PAUSE. F8 pour reprendre, Échap pour arrêter.")
+    while True:
+        time.sleep(0.05)
+        if _escape_pressed():
+            raise StopRequested("Touche Échap pressée")
+        pyautogui.failSafeCheck()
+        if _pause_toggled():
+            break
+    log.info("REPRISE.")
+    raise ResumeRequested()
 
 
 def check_stop() -> None:
@@ -169,6 +240,25 @@ def check_stop() -> None:
         raise StopRequested("Touche Échap pressée")
     # Lève pyautogui.FailSafeException si la souris est dans un coin.
     pyautogui.failSafeCheck()
+    if _pause_toggled():
+        _pause_loop()
+
+
+def alert(kind: str) -> None:
+    """Signal sonore : 'error' (blocage, 3 bips aigus) ou 'done' (fin, 1 bip)."""
+    if sys.platform != "win32":
+        print("\a", end="", flush=True)
+        return
+    import winsound
+    try:
+        if kind == "error":
+            for _ in range(3):
+                winsound.Beep(1000, 220)
+                time.sleep(0.08)
+        else:
+            winsound.Beep(660, 300)
+    except RuntimeError:
+        winsound.MessageBeep()
 
 
 def sleep(seconds: float) -> None:
@@ -295,20 +385,34 @@ def make_keyboard(backend: str):
     return ScancodeKeyboard()
 
 
-# Clavier actif (remplacé dans main() selon la configuration).
+# Clavier actif et comportement humain (remplacés dans main() selon la configuration).
 keyboard = PyAutoGuiKeyboard()
+human = Humanizer(HumanConfig(enabled=False))
+_held_keys: set = set()
+
+
+def release_all_keys() -> None:
+    for key in list(_held_keys):
+        try:
+            keyboard.up(key)
+        except Exception:
+            pass
+        _held_keys.discard(key)
 
 
 def tap(key: str, duration: Range) -> None:
-    """Pression courte d'une touche, durée de maintien aléatoire.
+    """Pression courte d'une touche, durée de maintien tirée dans duration.
 
     N'envoie rien tant que la fenêtre du jeu n'est pas au premier plan."""
     wait_for_focus()
+    hold = human.within(duration)
     keyboard.down(key)
+    _held_keys.add(key)
     try:
-        sleep(rand(duration))
+        sleep(hold)
     finally:
         keyboard.up(key)  # relâche la touche même en cas d'interruption
+        _held_keys.discard(key)
 
 
 # --------------------------------------------------------------------------- #
@@ -616,6 +720,49 @@ class BannerDetector:
         return self.score(frame_bgr) >= self.threshold
 
 
+class MessageDetector:
+    """Reconnaît des messages du jeu à partir d'images facultatives.
+
+    Chaque image fournie devient un nom de message (nom du fichier sans
+    extension) ; les images absentes sont simplement ignorées.
+    """
+
+    def __init__(self, paths: Sequence[Path], threshold: float, scales: Sequence[float]):
+        self.detectors: Dict[str, BannerDetector] = {}
+        for path in paths:
+            if path.exists():
+                self.detectors[path.stem] = BannerDetector(path, threshold, scales)
+
+    def __bool__(self) -> bool:
+        return bool(self.detectors)
+
+    def names(self) -> List[str]:
+        return sorted(self.detectors)
+
+    def find(self, frame_bgr: np.ndarray) -> Optional[str]:
+        """Nom du message visible (meilleur score au-dessus du seuil), sinon None."""
+        best_name, best_score = None, 0.0
+        for name, detector in self.detectors.items():
+            score = detector.score(frame_bgr)
+            if score >= detector.threshold and score > best_score:
+                best_name, best_score = name, score
+        return best_name
+
+
+def result_detector(cfg: Config) -> MessageDetector:
+    """templates/result_success.png et templates/result_fail.png (facultatifs)."""
+    return MessageDetector([cfg.templates_dir / "result_success.png",
+                            cfg.templates_dir / "result_fail.png"],
+                           cfg.message_threshold, cfg.banner_scales)
+
+
+def stop_detector(cfg: Config) -> MessageDetector:
+    """templates/stop/*.png : messages bloquants (inventaire plein, plus d'appât…)."""
+    stop_dir = cfg.templates_dir / "stop"
+    paths = sorted(stop_dir.glob("*.png")) if stop_dir.is_dir() else []
+    return MessageDetector(paths, cfg.message_threshold, cfg.banner_scales)
+
+
 # --------------------------------------------------------------------------- #
 # Détection de la jauge
 # --------------------------------------------------------------------------- #
@@ -710,16 +857,29 @@ class GaugeController:
       mouvement (vitesse estimée d'une image à l'autre) pour ne pas être en retard.
     - Hors de la tolérance, une pression Q ou D est envoyée, d'autant plus
       longue que l'écart est grand (à-coups courts quand on est proche).
+    - Réglage automatique : après chaque appui, le déplacement réel de la ligne
+      donne sa vitesse (px par seconde d'appui), qui sert ensuite à doser les
+      appuis. Si la ligne part systématiquement à l'opposé, Q et D sont inversés.
+    - Comportement humain (facultatif) : corrections parfois un peu en retard,
+      appuis parfois un peu trop longs.
     """
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, humanizer: Optional[Humanizer] = None):
         self.cfg = cfg
+        self.human = humanizer
         self._next_press_at = 0.0
         self._last: Optional[Tuple[float, float]] = None  # (instant, centre vert)
         self.velocity = 0.0                                # px/s de la zone verte
+        self.line_speed = cfg.line_speed                   # px/s d'appui (appris)
+        self.speed_samples = cfg.line_speed_min_samples if cfg.line_speed else 0
+        self.presses: Dict[str, int] = {cfg.key_left: 0, cfg.key_right: 0}
+        self.inverted_now = False                          # inversion faite pendant ce suivi
+        # Appui en attente de mesure : (sens attendu ±1, durée, x avant, fin de l'appui)
+        self._pending: Optional[Tuple[int, float, int, float]] = None
+        self._directions: List[bool] = []                  # True = sens attendu respecté
 
     def observe(self, state: GaugeState, now: float) -> None:
-        """Met à jour la vitesse estimée de la zone verte."""
+        """Met à jour la vitesse de la zone verte et mesure l'effet du dernier appui."""
         center = (state.green_left + state.green_right) / 2
         if self._last is not None:
             dt = now - self._last[0]
@@ -728,6 +888,39 @@ class GaugeController:
                 s = self.cfg.velocity_smoothing
                 self.velocity = s * self.velocity + (1 - s) * instant
         self._last = (now, center)
+        self._learn(state, now)
+
+    def _learn(self, state: GaugeState, now: float) -> None:
+        if self._pending is None or state.yellow_x is None or now < self._pending[3]:
+            return
+        expected, duration, x_before, _ = self._pending
+        self._pending = None
+        delta = state.yellow_x - x_before
+        if abs(delta) < 3 or duration <= 0:
+            return  # mouvement trop faible pour conclure
+        same_direction = (delta > 0) == (expected > 0)
+        self._directions = (self._directions + [same_direction])[-6:]
+        if same_direction:
+            sample = abs(delta) / duration
+            if self.line_speed is None:
+                self.line_speed = sample
+            else:
+                self.line_speed = 0.7 * self.line_speed + 0.3 * sample
+            self.speed_samples += 1
+        elif self.cfg.auto_invert and len(self._directions) >= 5 \
+                and self._directions.count(False) >= 4:
+            self.cfg.invert_controls = not self.cfg.invert_controls
+            self.inverted_now = True
+            self._directions.clear()
+            log.warning("La ligne jaune part à l'opposé des appuis : Q et D inversés "
+                        "automatiquement (mémorisé).")
+
+    def _direction_of(self, key: str) -> int:
+        """Sens attendu du mouvement de la ligne pour cette touche (+1 = droite)."""
+        right = key == self.cfg.key_right
+        if self.cfg.invert_controls:
+            right = not right
+        return 1 if right else -1
 
     def target(self, state: GaugeState) -> float:
         width = state.green_right - state.green_left
@@ -748,8 +941,13 @@ class GaugeController:
         if cfg.invert_controls:
             key = cfg.key_left if key == cfg.key_right else cfg.key_right
         lo, hi = cfg.press_duration
-        duration = lo + cfg.press_gain * abs(error) / width
-        duration = min(hi, max(lo, duration * random.uniform(0.85, 1.15)))
+        if self.line_speed and self.speed_samples >= cfg.line_speed_min_samples:
+            # Vitesse connue : appui qui couvre une part de l'écart.
+            duration = abs(error) * cfg.correction_fraction / self.line_speed
+        else:
+            duration = lo + cfg.press_gain * abs(error) / width
+        factor = self.human.press_factor() if self.human else random.uniform(0.85, 1.15)
+        duration = min(hi, max(lo, duration * factor))
         return key, duration
 
     def step(self, state: GaugeState) -> None:
@@ -760,12 +958,22 @@ class GaugeController:
         decision = self.decide(state)
         if decision is None:
             return
+        if self.human is not None:
+            late = self.human.skip_correction()
+            if late is not None:
+                self._next_press_at = now + late   # réaction un peu tardive
+                return
         key, duration = decision
-        log.debug("%s %.0f ms (jaune=%s, vert=[%d,%d], cible=%.0f, vitesse=%.0f px/s)",
-                  key.upper(), duration * 1000, state.yellow_x, state.green_left,
-                  state.green_right, self.target(state), self.velocity)
+        log.debug("%s %.0f ms (jaune=%s, vert=[%d,%d], cible=%.0f, vitesse=%.0f px/s, "
+                  "ligne=%s px/s)", key.upper(), duration * 1000, state.yellow_x,
+                  state.green_left, state.green_right, self.target(state), self.velocity,
+                  f"{self.line_speed:.0f}" if self.line_speed else "?")
+        x_before = state.yellow_x
         tap(key, (duration, duration))
-        self._next_press_at = time.perf_counter() + rand(self.cfg.press_cooldown)
+        self.presses[key] = self.presses.get(key, 0) + 1
+        end = time.perf_counter()
+        self._pending = (self._direction_of(key), duration, x_before, end)
+        self._next_press_at = end + rand(self.cfg.press_cooldown)
 
 
 # --------------------------------------------------------------------------- #
@@ -842,23 +1050,37 @@ def wait_for_gauge(cfg: Config, detector: GaugeDetector) -> bool:
     return False
 
 
-def track_gauge(cfg: Config, detector: GaugeDetector) -> bool:
-    """Suit la jauge jusqu'à sa disparition (absence continue > gauge_lost_grace).
+@dataclass
+class TrackResult:
+    disappeared: bool                       # False = durée max. atteinte
+    duration: float
+    presses_left: int
+    presses_right: int
+    in_zone_ratio: float                    # part des images où la ligne était dans le vert
 
-    Renvoie True si la jauge a disparu, False si la durée max. est atteinte."""
-    controller = GaugeController(cfg)
+
+def track_gauge(cfg: Config, detector: GaugeDetector) -> TrackResult:
+    """Suit la jauge jusqu'à sa disparition (absence continue > gauge_lost_grace)."""
+    controller = GaugeController(cfg, human if human.cfg.enabled else None)
     started = time.perf_counter()
     lost_since: Optional[float] = None
-    frames = recorded = 0
+    frames = recorded = seen = in_zone = 0
     if cfg.record_dir is not None:
         cfg.record_dir.mkdir(parents=True, exist_ok=True)
+
+    def result(disappeared: bool) -> TrackResult:
+        learn_from(cfg, controller)
+        return TrackResult(disappeared, time.perf_counter() - started,
+                           controller.presses.get(cfg.key_left, 0),
+                           controller.presses.get(cfg.key_right, 0),
+                           in_zone / seen if seen else 0.0)
 
     while True:
         check_stop()
         now = time.perf_counter()
         if now - started > cfg.gauge_max_duration:
             log.warning("Durée max. de suivi atteinte, arrêt du suivi.")
-            return False
+            return result(False)
 
         wait_for_focus()
         frame = grab(cfg.gauge_region or search_region())
@@ -874,36 +1096,91 @@ def track_gauge(cfg: Config, detector: GaugeDetector) -> bool:
             if now - lost_since >= cfg.gauge_lost_grace:
                 elapsed = now - started
                 log.info("Jauge disparue (%.1f s, %.0f img/s).", elapsed, frames / max(elapsed, 1e-6))
-                return True
+                return result(True)
             continue
         lost_since = None
+        if state.yellow_x is not None:
+            seen += 1
+            in_zone += state.green_left <= state.yellow_x <= state.green_right
         controller.step(state)
 
 
-def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector) -> None:
+def learn_from(cfg: Config, controller: GaugeController) -> None:
+    """Mémorise la vitesse de ligne apprise (et une éventuelle inversion Q/D)."""
+    changed = controller.inverted_now
+    if controller.line_speed and controller.speed_samples >= cfg.line_speed_min_samples:
+        if cfg.line_speed is None or abs(controller.line_speed - cfg.line_speed) > 1:
+            cfg.line_speed = round(controller.line_speed, 1)
+            changed = True
+            log.debug("Vitesse de la ligne jaune : %.0f px/s d'appui.", cfg.line_speed)
+    if changed:
+        remember_regions(cfg)
+
+
+def check_blockers(cfg: Config, stoppers: MessageDetector) -> None:
+    """Arrête le bot si un message bloquant (templates/stop/*.png) est visible."""
+    if not stoppers:
+        return
+    name = stoppers.find(grab(search_region()))
+    if name:
+        raise BlockedStop(f"message bloquant détecté à l'écran : « {name} »")
+
+
+def wait_for_result(cfg: Config, results: MessageDetector) -> str:
+    """'success', 'fail' ou 'unknown' selon le message affiché en fin de jauge."""
+    if not results:
+        return "unknown"
+    deadline = time.perf_counter() + cfg.result_timeout
+    while time.perf_counter() < deadline:
+        check_stop()
+        name = results.find(grab(search_region()))
+        if name:
+            return "success" if name.endswith("success") else "fail"
+        sleep(cfg.scan_interval)
+    return "unknown"
+
+
+def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number: int,
+              results: Optional[MessageDetector] = None,
+              stoppers: Optional[MessageDetector] = None) -> CycleRecord:
+    """Un cycle complet ; renvoie son résultat pour les statistiques."""
+    results = results or MessageDetector([], cfg.message_threshold, cfg.banner_scales)
+    stoppers = stoppers or MessageDetector([], cfg.message_threshold, cfg.banner_scales)
+    check_blockers(cfg, stoppers)
+
     # Étape 1 : lancement
     log.info("Étape 1 : appui sur %s", cfg.key_action.upper())
     tap(cfg.key_action, cfg.action_press_duration)
-    sleep(rand(cfg.start_delay))
+    sleep(human.within(cfg.start_delay))
 
-    # Étape 2 : bannière -> second appui
+    # Étape 2 : bannière -> second appui après un temps de réaction humain
+    waited = time.perf_counter()
     if not wait_for_banner(cfg, banner):
         log.warning("Bannière non détectée après %.0f s, cycle abandonné.", cfg.banner_timeout)
-        return
-    sleep(rand(cfg.reaction_delay))
+        check_blockers(cfg, stoppers)
+        return CycleRecord(number, "no_banner")
+    banner_wait = time.perf_counter() - waited
+    sleep(human.reaction() if human.cfg.enabled else rand(cfg.reaction_delay))
     tap(cfg.key_action, cfg.action_press_duration)
 
     # Étape 3 : régulation de la jauge
     if not wait_for_gauge(cfg, gauge):
         log.warning("Jauge non détectée après %.0f s, cycle abandonné.", cfg.gauge_appear_timeout)
-        return
-    if not track_gauge(cfg, gauge):
-        return
+        return CycleRecord(number, "no_gauge", banner_wait)
+    track = track_gauge(cfg, gauge)
+    record = CycleRecord(number, "timeout", banner_wait, track.duration,
+                         track.presses_left, track.presses_right, track.in_zone_ratio)
+    if not track.disappeared:
+        return record
 
-    # Étape 4 : jauge disparue -> appui sur F pour récupérer le poisson
-    sleep(rand(cfg.reaction_delay))
+    # Étape 4 : jauge disparue -> résultat, puis appui sur F
+    record.outcome = wait_for_result(cfg, results)
+    sleep(human.reaction() if human.cfg.enabled else rand(cfg.reaction_delay))
     log.info("Étape 4 : jauge disparue, appui sur %s", cfg.key_action.upper())
     tap(cfg.key_action, cfg.action_press_duration)
+    if record.outcome == "unknown" and results:
+        record.outcome = wait_for_result(cfg, results)   # message affiché après F ?
+    return record
 
 
 # --------------------------------------------------------------------------- #
@@ -1040,6 +1317,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="titre (ou partie du titre) de la fenêtre du jeu")
     p.add_argument("--list-windows", action="store_true",
                    help="affiche les titres des fenêtres ouvertes puis quitte")
+    p.add_argument("--duration", metavar="DURÉE",
+                   help="arrêt après cette durée (ex. 2h, 1h30, 90m)")
+    p.add_argument("--max-fish", type=int, metavar="N", help="arrêt après N poissons")
+    p.add_argument("--max-failures", type=int, metavar="N",
+                   help="arrêt après N cycles ratés de suite (défaut 3)")
+    p.add_argument("--no-breaks", action="store_true",
+                   help="pas de pauses de 5-15 min entre les sessions de jeu")
+    p.add_argument("--robotic", action="store_true",
+                   help="désactive le comportement humain (délais uniformes, sans imperfections)")
     p.add_argument("--invert", action="store_true", help="inverse Q et D")
     p.add_argument("--input", choices=("auto", "scancode", "pyautogui"),
                    help="méthode d'envoi des touches (auto = scancode sous Windows)")
@@ -1069,18 +1355,86 @@ def build_config(args: argparse.Namespace) -> Config:
         cfg.window_title = args.window
     if args.record:
         cfg.record_dir = Path("debug") / "track"
+    if args.duration:
+        cfg.session.max_duration = parse_duration(args.duration)
+    if args.max_fish:
+        cfg.session.max_fish = args.max_fish
+    if args.max_failures:
+        cfg.max_consecutive_failures = args.max_failures
+    if args.no_breaks:
+        cfg.session.breaks_enabled = False
+    if args.robotic:
+        cfg.human.enabled = False
     return cfg
 
 
+def take_break(seconds: float) -> None:
+    """Pause longue entre deux sessions de jeu (interruptible : Échap, F8)."""
+    resume_at = time.strftime("%H:%M", time.localtime(time.time() + seconds))
+    log.info("Pause de session : %s (reprise vers %s). F8 pour reprendre tout de suite.",
+             format_duration(seconds), resume_at)
+    sleep(seconds)
+    human.rest()
+
+
+def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
+             gauge: GaugeDetector, stats: Stats) -> None:
+    """Boucle principale : cycles, pauses, sessions, plafonds et arrêts sur blocage."""
+    planner = SessionPlanner(cfg.session)
+    results, stoppers = result_detector(cfg), stop_detector(cfg)
+    if results:
+        log.info("Messages de résultat reconnus : %s", ", ".join(results.names()))
+    if stoppers:
+        log.info("Messages bloquants surveillés : %s", ", ".join(stoppers.names()))
+
+    cycle = 0
+    while args.cycles == 0 or cycle < args.cycles:
+        reason = planner.finished(stats.fish)
+        if reason:
+            log.info("Fin : %s.", reason)
+            alert("done")
+            return
+        try:
+            pause = planner.break_due()
+            if pause:
+                take_break(pause)
+                planner.after_break()
+                wait_for_focus()
+
+            cycle += 1
+            log.info("===== Cycle %d =====", cycle)
+            record = run_cycle(cfg, banner, gauge, cycle, results, stoppers)
+            stats.add(record)
+            log.info("%s", stats.line(record))
+            if stats.consecutive_failures >= cfg.max_consecutive_failures:
+                raise BlockedStop(f"{stats.consecutive_failures} cycles ratés de suite")
+
+            wait = human.cycle_pause(cfg.cycle_pause)
+            log.info("Pause de %.1f s.", wait)
+            sleep(wait)
+        except ResumeRequested:
+            planner.after_break()           # une pause manuelle compte comme une pause
+            human.rest()
+            log.info("Nouveau cycle après la reprise.")
+            sleep(human.within((1.0, 2.0)))
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    global keyboard, target
+    global keyboard, target, human, PAUSE_VK
     args = parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
-    cfg = build_config(args)
+    try:
+        cfg = build_config(args)
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 1
+    human = Humanizer(cfg.human)
+    PAUSE_VK = cfg.pause_vk
+    stats = Stats(cfg.stats_path)
 
     pyautogui.FAILSAFE = True   # souris dans un coin = arrêt immédiat
     pyautogui.PAUSE = 0         # les délais sont gérés explicitement
@@ -1103,7 +1457,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         banner = BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)
         gauge = GaugeDetector(cfg)
 
-        log.info("Échap ou souris dans un coin de l'écran pour arrêter.")
+        log.info("F8 : pause/reprise. Échap ou souris dans un coin de l'écran : arrêt.")
+        log.info("Comportement humain : %s. Pauses de session : %s.",
+                 "activé" if cfg.human.enabled else "désactivé",
+                 "activées" if cfg.session.breaks_enabled else "désactivées")
         if sys.platform == "win32":
             target = pick_target(cfg, cfg.startup_countdown)
             warn_if_input_blocked(target)
@@ -1114,14 +1471,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log.info("Zones non mémorisées : recherche dans la fenêtre du jeu au premier "
                      "cycle, puis verrouillage automatique.")
 
-        cycle = 0
-        while args.cycles == 0 or cycle < args.cycles:
-            cycle += 1
-            log.info("===== Cycle %d =====", cycle)
-            run_cycle(cfg, banner, gauge)
-            pause = rand(cfg.cycle_pause)
-            log.info("Fin de cycle, pause de %.1f s.", pause)
-            sleep(pause)
+        try:
+            run_loop(cfg, args, banner, gauge, stats)
+        except ResumeRequested:
+            pass  # F8 pressé avant le premier cycle : rien à reprendre
+    except ResumeRequested:
+        log.info("Pause/reprise pendant le démarrage : relancez le bot.")
+    except BlockedStop as exc:
+        log.error("Arrêt automatique : %s.", exc)
+        alert("error")
     except StopRequested as exc:
         log.info("Arrêt demandé : %s", exc)
     except pyautogui.FailSafeException:
@@ -1138,6 +1496,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 keyboard.up(key)
             except Exception:
                 pass
+        if stats.records:
+            log.info("\n%s", stats.summary())
+            if cfg.stats_path is not None:
+                log.info("Détail des cycles : %s", cfg.stats_path)
     return 0
 
 

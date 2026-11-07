@@ -7,13 +7,50 @@ Boucle de test d'interface automatisée en Python (PyAutoGUI + OpenCV) :
 3. suivi de la jauge : la zone verte se déplace à gauche et à droite, et la ligne jaune est
    maintenue sur elle par des à-coups sur `Q` (gauche) et `D` (droite), jusqu'à ce que la
    jauge disparaisse ;
-4. appui sur `F` une fois la jauge disparue ;
-5. pause aléatoire de 3.0 s à 4.5 s, puis retour à l'étape 1.
+4. appui sur `F` une fois la jauge disparue (le résultat est lu s'il est reconnaissable) ;
+5. pause d'au moins 3 s, puis retour à l'étape 1.
 
 La ligne jaune vise le centre de la zone verte, avec une anticipation dans le sens où la zone
 se déplace. Les appuis sont d'autant plus longs que l'écart est grand. Seules les formes
 jaunes fines et verticales sont prises pour la ligne : une icône jaune à côté de la jauge ne
 fausse pas la mesure.
+
+**Réglage automatique** : après chaque appui sur Q ou D, le bot mesure de combien la ligne a
+réellement bougé. Il en déduit la vitesse de la ligne et dose ensuite ses appuis en
+conséquence. Cette vitesse est mémorisée d'une partie à l'autre. Si la ligne part
+systématiquement à l'opposé de l'appui, Q et D sont inversés automatiquement.
+
+## Comportement humain et sessions
+
+Activé par défaut (`--robotic` pour le désactiver) :
+
+- **temps de réaction réalistes** : la plupart entre 250 et 350 ms, avec de temps en temps une
+  réaction nettement plus lente ;
+- **fatigue** : les réactions ralentissent très légèrement au fil d'une session, et
+  redeviennent normales après une pause ;
+- **petites imperfections** : une correction de temps en temps un peu tardive, un appui
+  parfois un peu trop long ;
+- **pauses variées entre les cycles** : la plupart de 3 à 4,5 s, environ 1 sur 8 de 5 à
+  10 s, et environ 1 sur 30 de 10 à 20 s ;
+- **sessions** : 20 à 45 min de pêche, puis 5 à 15 min de pause (`--no-breaks` pour
+  désactiver).
+
+## Contrôle, sécurité et statistiques
+
+- **F8** : pause et reprise. Les touches sont relâchées pendant la pause, et un nouveau cycle
+  démarre à la reprise. F8 écourte aussi une pause de session.
+- **Arrêt automatique avec alerte sonore** après 3 cycles ratés de suite (bannière ou jauge
+  absente, échec, jauge trop longue). Le nombre se règle avec `--max-failures N`.
+- **Messages bloquants** : placez des captures recadrées de ces messages (inventaire plein,
+  plus d'appât…) dans `templates/stop/`, par exemple `templates/stop/inventaire_plein.png`.
+  Le bot s'arrête, avec une alerte, dès que l'un d'eux apparaît.
+- **Résultat de la prise** (facultatif) : `templates/result_success.png` et
+  `templates/result_fail.png`, recadrés sur le texte du message. Sans ces images, une jauge
+  terminée compte comme « terminé ».
+- **Plafonds** : `--duration 2h` (ou `1h30`, `90m`) et `--max-fish 100`.
+- **Statistiques** : chaque cycle est ajouté à `logs/catches.csv`, qui s'ouvre dans Excel. On
+  y trouve le résultat, l'attente de la bannière, la durée de la jauge, le nombre d'appuis
+  sur Q et D, et la part du temps passée dans le vert. Un résumé s'affiche à l'arrêt.
 
 ## Installation
 
@@ -39,6 +76,8 @@ ignorés pendant le choix. Le bot ne travaille ensuite que dans cette fenêtre :
 
 ```bash
 python hook.py                       # boucle infinie
+python hook.py --duration 2h         # 2 heures, puis arrêt avec un bip
+python hook.py --max-fish 100        # 100 poissons, puis arrêt
 python hook.py --record -v          # enregistre le suivi annoté dans debug/track/
 python hook.py --list-windows        # titres des fenêtres ouvertes
 python hook.py --window "Nom du jeu" # cible la fenêtre par son titre (et le mémorise)
@@ -100,5 +139,10 @@ Les touches sont toujours relâchées à l'arrêt.
 python -m unittest discover -s tests
 ```
 
-Ces tests vérifient les détecteurs et le correcteur sur des images synthétiques. Ils ne
-nécessitent ni écran ni fenêtre cible.
+Ces tests ne nécessitent ni écran ni fenêtre cible. Ils vérifient :
+
+- les détecteurs et le correcteur, sur des images synthétiques ;
+- le comportement humain, les sessions et les statistiques ;
+- l'apprentissage de la vitesse de la ligne et l'inversion automatique de Q et D ;
+- un cycle complet contre un faux jeu, avec bannière, jauge pilotée par Q/D et message de
+  réussite.
