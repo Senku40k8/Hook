@@ -794,6 +794,42 @@ class BannerDetector:
     def detect(self, frame_bgr: np.ndarray) -> bool:
         return self.score(frame_bgr) >= self.threshold
 
+    def locate_all(self, frame_bgr: np.ndarray, max_results: int = 5) -> List[Tuple[float, Region]]:
+        """Toutes les occurrences au-dessus du seuil (ex. deux boutons « Purchase »
+        visibles en même temps), de la meilleure à la moins bonne."""
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        if self.edges:
+            gray = edge_map(gray)
+        found: List[Tuple[float, Region]] = []
+        for tpl in self.templates:
+            th, tw = tpl.shape[:2]
+            if th > gray.shape[0] or tw > gray.shape[1]:
+                continue
+            result = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
+            for _ in range(max_results):
+                _, value, _, (x, y) = cv2.minMaxLoc(result)
+                if value < self.threshold:
+                    break
+                found.append((float(value), (x, y, tw, th)))
+                # Efface ce pic pour trouver l'occurrence suivante.
+                result[max(0, y - th // 2):y + th // 2 + 1, max(0, x - tw // 2):x + tw // 2 + 1] = -1
+        found.sort(key=lambda f: f[0], reverse=True)
+        unique: List[Tuple[float, Region]] = []
+        for score, box in found:   # même bouton trouvé à plusieurs échelles : garder le meilleur
+            if all(not boxes_overlap(box, other) for _, other in unique):
+                unique.append((score, box))
+        return unique[:max_results]
+
+
+def box_center(box: Region) -> Tuple[float, float]:
+    return box[0] + box[2] / 2, box[1] + box[3] / 2
+
+
+def boxes_overlap(a: Region, b: Region) -> bool:
+    """Vrai si les centres sont à moins d'une demi-taille l'un de l'autre."""
+    (ax, ay), (bx, by) = box_center(a), box_center(b)
+    return abs(ax - bx) < max(a[2], b[2]) / 2 and abs(ay - by) < max(a[3], b[3]) / 2
+
 
 class MessageDetector:
     """Reconnaît des messages du jeu à partir d'images facultatives.
@@ -1247,6 +1283,10 @@ TEMPLATE_THRESHOLDS: Dict[str, float] = {"bait_slot_empty": 0.88}
 CLICK_AREAS: Dict[str, Tuple[float, float, float, float]] = {
     "bait_slot_empty": (0.2, 0.1, 0.8, 0.65),
 }
+# Éléments dont l'aspect peut changer entre deux clics : si on ne les retrouve
+# pas, on reclique à leur position précédente. (Jamais pour « Purchase » : le
+# premier bouton peut rester visible derrière la boutique.)
+REUSE_POSITION = {"bait_slot_empty"}
 
 
 def click_area(name: str, box: Region) -> Region:
@@ -1278,31 +1318,67 @@ class Restocker:
         """True si la case d'appât vide (« Not Selected ») est visible."""
         return self.buttons["bait_slot_empty"].detect(grab(search_region()))
 
-    def wait_for_button(self, name: str, timeout: Optional[float] = None) -> Region:
+    def wait_for_button(self, name: str, timeout: Optional[float] = None,
+                        avoid: Sequence[Region] = ()) -> Region:
         """Attend que le bouton soit visible et immobile (fin d'animation) ;
-        renvoie son rectangle en coordonnées écran."""
+        renvoie son rectangle en coordonnées écran.
+
+        avoid : positions déjà cliquées. Si plusieurs boutons identiques sont
+        visibles (ex. deux « Purchase »), on prend celui qui n'y est pas."""
         detector = self.buttons[name]
-        deadline = time.perf_counter() + (timeout or self.cfg.restock_step_timeout)
+        timeout = timeout or self.cfg.restock_step_timeout
+        deadline = time.perf_counter() + timeout
+        # Pendant la première moitié du délai, n'accepter qu'un bouton situé
+        # ailleurs qu'aux positions déjà cliquées ; ensuite, la même position
+        # est admise (le nouveau bouton peut s'afficher au même endroit).
+        strict_until = time.perf_counter() + timeout / 2 if avoid else 0.0
         previous: Optional[Region] = None
+        frame, region = None, None
         while time.perf_counter() < deadline:
             check_stop()
             wait_for_focus()
             region = search_region()
-            score, box = detector.locate(grab(region))
-            if score >= detector.threshold and box is not None:
-                screen_box = (region[0] + box[0], region[1] + box[1], box[2], box[3])
-                if previous is not None and abs(previous[0] - screen_box[0]) <= 3 \
-                        and abs(previous[1] - screen_box[1]) <= 3:
-                    return screen_box
-                previous = screen_box
+            frame = grab(region)
+            candidates = [(s, (region[0] + b[0], region[1] + b[1], b[2], b[3]))
+                          for s, b in detector.locate_all(frame)]
+            fresh = [c for c in candidates
+                     if not any(boxes_overlap(c[1], old) for old in avoid)]
+            if fresh:
+                chosen = fresh[0][1]
+            elif candidates and time.perf_counter() >= strict_until:
+                chosen = candidates[0][1]
+            else:
+                chosen = None
+            if chosen is not None:
+                if previous is not None and abs(previous[0] - chosen[0]) <= 3 \
+                        and abs(previous[1] - chosen[1]) <= 3:
+                    if len(candidates) > 1:
+                        log.debug("  %d « %s » visibles, choix de %s", len(candidates), name, chosen)
+                    return chosen
+                previous = chosen
             else:
                 previous = None
             sleep(0.08)
+        self._save_failure(name, frame, detector)
         raise RestockFailed(f"bouton « {name} » introuvable")
+
+    def _save_failure(self, name: str, frame: Optional[np.ndarray],
+                      detector: BannerDetector) -> None:
+        """Capture d'écran pour comprendre pourquoi un bouton n'a pas été trouvé."""
+        if frame is None:
+            return
+        try:
+            out = Path("debug") / f"restock_{name}_{time.strftime('%H%M%S')}.png"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out), frame)
+            log.warning("  « %s » introuvable (meilleur score %.2f, seuil %.2f). Capture : %s",
+                        name, detector.score(frame), detector.threshold, out)
+        except Exception:
+            pass
 
     def run(self) -> None:
         log.info("Réapprovisionnement en appâts…")
-        seen: Dict[str, Region] = {}
+        clicked: Dict[str, List[Region]] = {}
         try:
             for action, value in RESTOCK_STEPS:
                 # Rythme humain : courte pause, parfois une hésitation.
@@ -1311,16 +1387,18 @@ class Restocker:
                     log.info("  touche %s", value.upper())
                     tap(value, self.cfg.action_press_duration)
                     continue
-                if value in seen:
-                    # Élément déjà cliqué (case d'appât) : son aspect peut avoir
-                    # changé après l'achat ; à défaut, on reprend sa position.
+                before = clicked.get(value, [])
+                if before and value in REUSE_POSITION:
+                    # Case d'appât : son aspect peut avoir changé après l'achat ;
+                    # à défaut de la retrouver, on reclique à sa position.
                     try:
                         box = self.wait_for_button(value, timeout=2.0)
                     except RestockFailed:
-                        box = seen[value]
+                        box = before[-1]
                 else:
-                    box = self.wait_for_button(value)
-                seen[value] = box
+                    # Bouton déjà cliqué (2e « Purchase ») : surtout pas le même.
+                    box = self.wait_for_button(value, avoid=before)
+                clicked.setdefault(value, []).append(box)
                 sleep(human.reaction())         # temps de repérer le bouton apparu
                 log.info("  clic sur %s", value)
                 click_box(click_area(value, box))

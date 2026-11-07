@@ -379,10 +379,13 @@ class FakeShop:
     IMAGE = {"slot_empty": "bait_slot_empty", "slot_empty2": "bait_slot_empty",
              "purchase1": "purchase", "purchase2": "purchase"}
 
-    def __init__(self):
+    def __init__(self, ghost_purchase=False):
         self.screen = "idle"
         self.keys, self.clicks, self.events = [], [], []
         self.button_box = None
+        # Le 1er « Purchase » reste visible derrière la boutique (cas réel).
+        self.ghost_purchase = ghost_purchase
+        self.ghost_box = None
         self.images = {p.stem: cv2.imread(str(p)) for p in RESTOCK_DIR.glob("*.png")}
         self.images["equipped"] = equipped_slot(self.images["bait_slot_empty"])
         self.banner = cv2.imread(str(EQUIP_BANNER))
@@ -414,18 +417,24 @@ class FakeShop:
 
     # --- écran ---
     def grab(self, region=None):
-        canvas = np.full((700, 1000, 3), 35, np.uint8)
+        canvas = np.full((1000, 1000, 3), 35, np.uint8)
         name = self.IMAGE.get(self.screen, self.screen)
         if self.screen == "equip_banner":
             h, w = self.banner.shape[:2]
-            canvas[60:60 + h, 200:200 + w] = self.banner
+            canvas[20:20 + h, 200:200 + w] = self.banner
             name = "bait_slot_empty"
+        if self.ghost_purchase and self.ghost_box and self.screen in (
+                "universal_bait", "max_quantity", "purchase2"):
+            gx, gy, gw, gh = self.ghost_box
+            canvas[gy:gy + gh, gx:gx + gw] = self.images["purchase"]
         if name in self.images:
             img = self.images[name]
             h, w = img.shape[:2]
-            x, y = 300 + 7 * len(self.clicks), 250 + 11 * len(self.clicks)
+            x, y = 300 + 7 * len(self.clicks), 100 + 70 * len(self.clicks)
             canvas[y:y + h, x:x + w] = img
             self.button_box = (x, y, w, h)
+            if self.screen == "purchase1":
+                self.ghost_box = self.button_box
         return canvas
 
 
@@ -476,6 +485,29 @@ class RestockTest(unittest.TestCase):
         events = self.shop.events
         i = events.index("clic purchase2")
         self.assertEqual(events[i + 1:i + 3], ["esc", "esc"])
+
+    def test_first_purchase_still_visible_behind_shop(self):
+        """Bug « bloqué après double chevrons » : le 1er Purchase reste affiché
+        derrière la boutique ; le bot doit cliquer le nouveau, puis Échap x2."""
+        self.shop.ghost_purchase = True
+        self.shop.screen = "slot_empty"
+        record = self.cycle()
+        self.assertEqual(record.outcome, "restock")
+        self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
+        self.assertEqual(self.shop.screen, "equipped")
+        events = self.shop.events
+        i = events.index("clic max_quantity")
+        self.assertEqual(events[i + 1:i + 4], ["clic purchase2", "esc", "esc"])
+
+    def test_purchase_failure_still_escapes_twice(self):
+        self.shop.CLICKS = dict(FakeShop.CLICKS, max_quantity="nothing")  # Purchase n'apparaît pas
+        self.shop.screen = "slot_empty"
+        self.cfg.restock_step_timeout = 0.4
+        with self.assertRaises(hook.BlockedStop):
+            self.cycle()
+        events = self.shop.events
+        i = events.index("clic max_quantity")
+        self.assertEqual(events[i + 1:], ["esc", "esc"])
 
     def test_equipped_slot_does_not_trigger(self):
         self.shop.screen = "equipped"
