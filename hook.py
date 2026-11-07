@@ -74,6 +74,8 @@ class Config:
     # ensuite lui-même au premier plan.
     window_title: Optional[str] = None
     config_path: Optional[Path] = None      # où mémoriser les zones (non persisté)
+    record_dir: Optional[Path] = None       # --record : images annotées du suivi
+    record_max_frames: int = 600
 
     # --- Détection de la bannière (template matching) ----------------------
     banner_template: Path = Path(__file__).with_name("templates") / "fish_on_hook.png"
@@ -89,18 +91,23 @@ class Config:
     gauge_min_width: int = 30               # largeur min. de la zone verte (px)
     gauge_min_aspect: float = 2.5           # largeur/hauteur min. (barre horizontale)
     gauge_bridge_px: int = 15               # comble la coupure créée par la ligne jaune
-    yellow_min_pixels: int = 6              # nb de pixels jaunes min. pour valider l'indicateur
-    deadzone_ratio: float = 0.20            # marge intérieure (fraction de la largeur verte)
-    # Zone verrouillée autour de la jauge : barre verte ± max(N x sa largeur, min px).
-    gauge_lock_width_factor: float = 3.0
-    gauge_lock_min_half_width: int = 350
-    gauge_lock_vertical_pad: int = 40
+    yellow_min_pixels: int = 6              # nb de pixels min. d'une ligne jaune
+    yellow_min_height: int = 5              # hauteur min. de la ligne jaune (px)
+    yellow_min_aspect: float = 1.5          # hauteur/largeur min. (ligne verticale)
+    yellow_search_factor: float = 4.0       # portée de recherche (x largeur verte, de chaque côté)
+    gauge_lock_vertical_pad: int = 60       # marge verticale de la zone verrouillée (px)
+
+    # --- Régulation --------------------------------------------------------
+    deadzone_ratio: float = 0.15            # tolérance autour de la cible (fraction de la largeur verte)
+    lead_time: float = 0.15                 # anticipation du mouvement de la zone verte (s)
+    velocity_smoothing: float = 0.5         # lissage de la vitesse estimée (0..1)
+    press_gain: float = 0.30                # s d'appui par largeur verte d'écart
 
     # --- Temporisations (secondes, bornes min/max des tirages aléatoires) ---
     start_delay: Range = (0.5, 1.5)         # après le premier F
     reaction_delay: Range = (0.12, 0.30)    # entre la bannière et le second F
     action_press_duration: Range = (0.08, 0.15)  # durée d'appui sur F (lu à chaque image par le jeu)
-    press_duration: Range = (0.03, 0.08)    # durée d'une pression Q/D
+    press_duration: Range = (0.03, 0.20)    # durée min./max. d'une pression Q/D
     press_cooldown: Range = (0.04, 0.10)    # intervalle min. entre deux corrections
     cycle_pause: Range = (3.0, 4.5)         # fin de cycle
     startup_countdown: float = 1.0          # délai après l'arrivée du jeu au premier plan
@@ -639,18 +646,29 @@ class GaugeDetector:
         yellow = cv2.inRange(hsv, np.array(self.cfg.yellow_lower), np.array(self.cfg.yellow_upper))
         return hsv, green, yellow
 
-    def detect(self, frame_bgr: np.ndarray, search: bool = False) -> Optional[GaugeState]:
-        """Analyse une image de la jauge.
+    def yellow_lines(self, yellow: np.ndarray) -> list:
+        """Formes jaunes verticales (x, y, w, h) : candidates pour la ligne jaune.
+        Les éléments jaunes trapus (icônes, texte) sont écartés."""
+        cfg = self.cfg
+        count, _, stats, _ = cv2.connectedComponentsWithStats(yellow, connectivity=8)
+        lines = []
+        for i in range(1, count):
+            x, y, w, h, area = stats[i]
+            if area >= cfg.yellow_min_pixels and h >= cfg.yellow_min_height \
+                    and h >= cfg.yellow_min_aspect * w:
+                lines.append((int(x), int(y), int(w), int(h)))
+        return lines
 
-        search=False : l'image est la zone de la jauge ; la ligne jaune est
-                       cherchée sur toute sa largeur.
-        search=True  : l'image est l'écran entier ; une barre verte n'est retenue
-                       que si une ligne jaune se trouve à proximité, pour ne pas
-                       confondre la jauge avec le vert du décor.
+    def detect(self, frame_bgr: np.ndarray, search: bool = True) -> Optional[GaugeState]:
+        """Localise la jauge : barre verte horizontale + ligne jaune verticale.
+
+        Une barre verte n'est retenue que si une ligne jaune la croise ou se
+        trouve à proximité : le vert du décor est ainsi ignoré, et la jauge est
+        considérée comme disparue dès que l'ensemble n'est plus visible.
+        search=False accepte une barre verte sans ligne jaune (calibration).
         """
         cfg = self.cfg
         _, green, yellow = self.masks(frame_bgr)
-        frame_w = yellow.shape[1]
 
         # 1) Zones vertes candidates : contours en forme de barre horizontale.
         contours, _ = cv2.findContours(green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -660,24 +678,24 @@ class GaugeDetector:
             if w >= cfg.gauge_min_width and h > 0 and w / h >= cfg.gauge_min_aspect:
                 candidates.append((x, y, w, h))
         candidates.sort(key=lambda b: b[2] * b[3], reverse=True)
+        lines = self.yellow_lines(yellow)
 
         for x, y, w, h in candidates:
-            # 2) Indicateur jaune, dans la bande horizontale de la jauge
-            #    (élargie verticalement car la ligne dépasse souvent de la barre).
-            pad = max(3, h)
-            y0, y1 = max(0, y - pad), min(yellow.shape[0], y + h + pad)
-            if search:
-                x0 = max(0, x - 2 * w)
-                x1 = min(frame_w, x + 3 * w)
-            else:
-                x0, x1 = 0, frame_w
-            column_counts = np.count_nonzero(yellow[y0:y1, x0:x1], axis=0)
-            yellow_x = None
-            if column_counts.sum() >= cfg.yellow_min_pixels:
-                # Centre de masse horizontal des pixels jaunes.
-                yellow_x = x0 + int(round(np.average(np.arange(x1 - x0), weights=column_counts)))
-            if search and yellow_x is None:
-                continue  # barre verte sans indicateur : probablement le décor
+            # 2) Ligne jaune : forme verticale qui chevauche la barre en hauteur,
+            #    à moins de yellow_search_factor x largeur de la zone verte ;
+            #    la plus proche du centre de la zone verte.
+            center = x + w / 2
+            reach = w / 2 + cfg.yellow_search_factor * w
+            best = None
+            for lx, ly, lw, lh in lines:
+                overlaps = ly <= y + h + h and ly + lh >= y - h
+                line_x = lx + lw / 2
+                if overlaps and abs(line_x - center) <= reach:
+                    if best is None or abs(line_x - center) < abs(best - center):
+                        best = line_x
+            if best is None and search:
+                continue  # barre verte sans ligne jaune : probablement le décor
+            yellow_x = None if best is None else int(round(best))
             return GaugeState(x, x + w, y, y + h, yellow_x)
         return None
 
@@ -686,38 +704,67 @@ class GaugeDetector:
 # Régulation de l'indicateur
 # --------------------------------------------------------------------------- #
 class GaugeController:
-    """Correcteur tout-ou-rien avec zone morte et cadence limitée."""
+    """Fait suivre à la ligne jaune la zone verte, qui se déplace.
+
+    - La cible est le centre de la zone verte, décalé dans le sens de son
+      mouvement (vitesse estimée d'une image à l'autre) pour ne pas être en retard.
+    - Hors de la tolérance, une pression Q ou D est envoyée, d'autant plus
+      longue que l'écart est grand (à-coups courts quand on est proche).
+    """
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._next_press_at = 0.0
+        self._last: Optional[Tuple[float, float]] = None  # (instant, centre vert)
+        self.velocity = 0.0                                # px/s de la zone verte
 
-    def decide(self, state: GaugeState) -> Optional[str]:
-        """Touche à presser pour recentrer l'indicateur, ou None."""
+    def observe(self, state: GaugeState, now: float) -> None:
+        """Met à jour la vitesse estimée de la zone verte."""
+        center = (state.green_left + state.green_right) / 2
+        if self._last is not None:
+            dt = now - self._last[0]
+            if dt > 1e-3:
+                instant = (center - self._last[1]) / dt
+                s = self.cfg.velocity_smoothing
+                self.velocity = s * self.velocity + (1 - s) * instant
+        self._last = (now, center)
+
+    def target(self, state: GaugeState) -> float:
+        width = state.green_right - state.green_left
+        center = (state.green_left + state.green_right) / 2
+        lead = self.velocity * self.cfg.lead_time
+        return center + max(-width, min(width, lead))
+
+    def decide(self, state: GaugeState) -> Optional[Tuple[str, float]]:
+        """(touche, durée d'appui) pour rapprocher la ligne jaune de la cible, ou None."""
         if state.yellow_x is None:
             return None
-        width = state.green_right - state.green_left
-        margin = width * self.cfg.deadzone_ratio
-        if state.yellow_x < state.green_left + margin:
-            key = self.cfg.key_right   # indicateur trop à gauche -> pousser à droite
-        elif state.yellow_x > state.green_right - margin:
-            key = self.cfg.key_left    # indicateur trop à droite -> pousser à gauche
-        else:
+        cfg = self.cfg
+        width = max(1, state.green_right - state.green_left)
+        error = self.target(state) - state.yellow_x
+        if abs(error) <= width * cfg.deadzone_ratio:
             return None
-        if self.cfg.invert_controls:
-            key = self.cfg.key_left if key == self.cfg.key_right else self.cfg.key_right
-        return key
+        key = cfg.key_right if error > 0 else cfg.key_left
+        if cfg.invert_controls:
+            key = cfg.key_left if key == cfg.key_right else cfg.key_right
+        lo, hi = cfg.press_duration
+        duration = lo + cfg.press_gain * abs(error) / width
+        duration = min(hi, max(lo, duration * random.uniform(0.85, 1.15)))
+        return key, duration
 
     def step(self, state: GaugeState) -> None:
         now = time.perf_counter()
+        self.observe(state, now)
         if now < self._next_press_at:
             return
-        key = self.decide(state)
-        if key is None:
+        decision = self.decide(state)
+        if decision is None:
             return
-        log.debug("Correction %s (jaune=%s, vert=[%d,%d])",
-                  key.upper(), state.yellow_x, state.green_left, state.green_right)
-        tap(key, self.cfg.press_duration)
+        key, duration = decision
+        log.debug("%s %.0f ms (jaune=%s, vert=[%d,%d], cible=%.0f, vitesse=%.0f px/s)",
+                  key.upper(), duration * 1000, state.yellow_x, state.green_left,
+                  state.green_right, self.target(state), self.velocity)
+        tap(key, (duration, duration))
         self._next_press_at = time.perf_counter() + rand(self.cfg.press_cooldown)
 
 
@@ -734,14 +781,26 @@ def banner_lock_region(match: Region, frame_region: Region) -> Region:
 
 
 def gauge_lock_region(cfg: Config, state: GaugeState, frame_region: Region) -> Region:
-    """Zone de la jauge : bande centrée sur la barre verte, assez large pour
-    couvrir tout le rail sur lequel la zone verte et la ligne jaune se déplacent."""
-    width = state.green_right - state.green_left
-    cx = frame_region[0] + (state.green_left + state.green_right) // 2
+    """Zone de la jauge : bande horizontale sur toute la largeur de la fenêtre,
+    pour suivre la zone verte où qu'elle aille, et limitée en hauteur."""
     cy = frame_region[1] + (state.green_top + state.green_bottom) // 2
-    half_w = max(int(width * cfg.gauge_lock_width_factor), cfg.gauge_lock_min_half_width)
     half_h = (state.green_bottom - state.green_top) // 2 + cfg.gauge_lock_vertical_pad
-    return clip_region(cx - half_w, cy - half_h, cx + half_w, cy + half_h, frame_region)
+    left, _, width, _ = frame_region
+    return clip_region(left, cy - half_h, left + width, cy + half_h, frame_region)
+
+
+def annotate(frame: np.ndarray, state: Optional[GaugeState],
+             target_x: Optional[float] = None) -> np.ndarray:
+    """Image de debug : zone verte (magenta), ligne jaune (rouge), cible (cyan)."""
+    out = frame.copy()
+    if state is not None:
+        cv2.rectangle(out, (state.green_left, state.green_top),
+                      (state.green_right, state.green_bottom), (255, 0, 255), 2)
+        if state.yellow_x is not None:
+            cv2.line(out, (state.yellow_x, 0), (state.yellow_x, out.shape[0]), (0, 0, 255), 2)
+        if target_x is not None:
+            cv2.line(out, (int(target_x), 0), (int(target_x), out.shape[0]), (255, 255, 0), 1)
+    return out
 
 
 def wait_for_banner(cfg: Config, detector: BannerDetector) -> bool:
@@ -771,7 +830,7 @@ def wait_for_gauge(cfg: Config, detector: GaugeDetector) -> bool:
         wait_for_focus()
         searching = cfg.gauge_region is None
         region = cfg.gauge_region or search_region()
-        state = detector.detect(grab(region), search=searching)
+        state = detector.detect(grab(region))
         if state is not None:
             log.info("Jauge détectée, début du suivi.")
             if searching and cfg.auto_lock_regions:
@@ -783,30 +842,39 @@ def wait_for_gauge(cfg: Config, detector: GaugeDetector) -> bool:
     return False
 
 
-def track_gauge(cfg: Config, detector: GaugeDetector) -> None:
-    """Suit la jauge jusqu'à sa disparition (absence continue > gauge_lost_grace)."""
+def track_gauge(cfg: Config, detector: GaugeDetector) -> bool:
+    """Suit la jauge jusqu'à sa disparition (absence continue > gauge_lost_grace).
+
+    Renvoie True si la jauge a disparu, False si la durée max. est atteinte."""
     controller = GaugeController(cfg)
     started = time.perf_counter()
     lost_since: Optional[float] = None
-    frames = 0
+    frames = recorded = 0
+    if cfg.record_dir is not None:
+        cfg.record_dir.mkdir(parents=True, exist_ok=True)
 
     while True:
         check_stop()
         now = time.perf_counter()
         if now - started > cfg.gauge_max_duration:
             log.warning("Durée max. de suivi atteinte, arrêt du suivi.")
-            return
+            return False
 
         wait_for_focus()
-        state = detector.detect(grab(cfg.gauge_region or search_region()),
-                                search=cfg.gauge_region is None)
+        frame = grab(cfg.gauge_region or search_region())
+        state = detector.detect(frame)
         frames += 1
+        if cfg.record_dir is not None and recorded < cfg.record_max_frames:
+            target_x = controller.target(state) if state else None
+            cv2.imwrite(str(cfg.record_dir / f"track_{recorded:04d}.png"),
+                        annotate(frame, state, target_x))
+            recorded += 1
         if state is None:
             lost_since = lost_since or now
             if now - lost_since >= cfg.gauge_lost_grace:
                 elapsed = now - started
                 log.info("Jauge disparue (%.1f s, %.0f img/s).", elapsed, frames / max(elapsed, 1e-6))
-                return
+                return True
             continue
         lost_since = None
         controller.step(state)
@@ -829,7 +897,13 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector) -> None
     if not wait_for_gauge(cfg, gauge):
         log.warning("Jauge non détectée après %.0f s, cycle abandonné.", cfg.gauge_appear_timeout)
         return
-    track_gauge(cfg, gauge)
+    if not track_gauge(cfg, gauge):
+        return
+
+    # Étape 4 : jauge disparue -> appui sur F pour récupérer le poisson
+    sleep(rand(cfg.reaction_delay))
+    log.info("Étape 4 : jauge disparue, appui sur %s", cfg.key_action.upper())
+    tap(cfg.key_action, cfg.action_press_duration)
 
 
 # --------------------------------------------------------------------------- #
@@ -927,13 +1001,9 @@ def calibrate(cfg: Config, out_dir: Path) -> None:
     frame = grab(cfg.gauge_region)
     detector = GaugeDetector(cfg)
     _, green, yellow = detector.masks(frame)
-    state = detector.detect(frame, search=cfg.gauge_region is None)
-    annotated = frame.copy()
-    if state:
-        cv2.rectangle(annotated, (state.green_left, state.green_top),
-                      (state.green_right, state.green_bottom), (255, 0, 255), 2)
-        if state.yellow_x is not None:
-            cv2.line(annotated, (state.yellow_x, 0), (state.yellow_x, annotated.shape[0]), (0, 0, 255), 2)
+    state = detector.detect(frame)
+    annotated = annotate(frame, state)
+    log.info("Lignes jaunes verticales trouvées : %d", len(detector.yellow_lines(yellow)))
     cv2.imwrite(str(out_dir / "gauge_frame.png"), frame)
     cv2.imwrite(str(out_dir / "gauge_green_mask.png"), green)
     cv2.imwrite(str(out_dir / "gauge_yellow_mask.png"), yellow)
@@ -958,6 +1028,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--setup", action="store_true",
                    help="réglage interactif des zones et couleurs, enregistré dans hook_config.json")
     p.add_argument("--calibrate", action="store_true", help="capture de vérification puis sortie")
+    p.add_argument("--record", action="store_true",
+                   help="enregistre les images annotées du suivi de jauge dans debug/track/")
     p.add_argument("--reset", action="store_true",
                    help="oublie les zones mémorisées (nouvelle détection automatique)")
     p.add_argument("--config", type=Path, default=CONFIG_FILE, help="fichier de réglages")
@@ -995,6 +1067,8 @@ def build_config(args: argparse.Namespace) -> Config:
         cfg.input_backend = args.input
     if args.window:
         cfg.window_title = args.window
+    if args.record:
+        cfg.record_dir = Path("debug") / "track"
     return cfg
 
 

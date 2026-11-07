@@ -4,8 +4,16 @@ Boucle de test d'interface automatisée en Python (PyAutoGUI + OpenCV) :
 
 1. appui sur `F`, puis latence aléatoire de 0.5 s à 1.5 s ;
 2. attente de la bannière « Fish on the hook! Press the button to reel it! », puis nouvel appui sur `F` ;
-3. suivi de la jauge (zone verte + indicateur jaune) avec des pressions courtes sur `Q` (gauche) et `D` (droite), jusqu'à ce que la jauge disparaisse ;
-4. pause aléatoire de 3.0 s à 4.5 s, puis retour à l'étape 1.
+3. suivi de la jauge : la zone verte se déplace à gauche et à droite, et la ligne jaune est
+   maintenue sur elle par des à-coups sur `Q` (gauche) et `D` (droite), jusqu'à ce que la
+   jauge disparaisse ;
+4. appui sur `F` une fois la jauge disparue ;
+5. pause aléatoire de 3.0 s à 4.5 s, puis retour à l'étape 1.
+
+La ligne jaune vise le centre de la zone verte, avec une anticipation dans le sens où la zone
+se déplace. Les appuis sont d'autant plus longs que l'écart est grand. Seules les formes
+jaunes fines et verticales sont prises pour la ligne : une icône jaune à côté de la jauge ne
+fausse pas la mesure.
 
 ## Installation
 
@@ -31,6 +39,7 @@ ignorés pendant le choix. Le bot ne travaille ensuite que dans cette fenêtre :
 
 ```bash
 python hook.py                       # boucle infinie
+python hook.py --record -v          # enregistre le suivi annoté dans debug/track/
 python hook.py --list-windows        # titres des fenêtres ouvertes
 python hook.py --window "Nom du jeu" # cible la fenêtre par son titre (et le mémorise)
 python hook.py --cycles 10 -v        # 10 cycles, logs détaillés

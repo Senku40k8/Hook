@@ -57,6 +57,20 @@ class GaugeDetectorTest(unittest.TestCase):
     def test_no_gauge(self):
         self.assertIsNone(self.detector.detect(np.full((60, 400, 3), 20, np.uint8)))
 
+    def test_static_yellow_icon_does_not_bias_line(self):
+        """Une icône jaune trapue à gauche (bug « ne va qu'à droite ») est ignorée :
+        seule la ligne verticale compte."""
+        img = make_gauge(150, 250, 220)
+        cv2.rectangle(img, (25, 20), (45, 40), YELLOW_BGR, -1)   # icône 21x21
+        state = self.detector.detect(img)
+        self.assertAlmostEqual(state.yellow_x, 220, delta=2)
+
+    def test_green_without_line_is_not_a_gauge(self):
+        self.assertIsNone(self.detector.detect(make_gauge(150, 250, None)))
+        state = self.detector.detect(make_gauge(150, 250, None), search=False)
+        self.assertIsNotNone(state)
+        self.assertIsNone(state.yellow_x)
+
     def test_search_ignores_green_scenery_without_yellow(self):
         """Plein écran : une grande bande verte du décor (sans ligne jaune) est
         ignorée au profit de la vraie jauge, plus petite mais avec indicateur."""
@@ -76,8 +90,7 @@ class GaugeDetectorTest(unittest.TestCase):
     def test_gauge_lock_region_contains_bar(self):
         state = hook.GaugeState(850, 951, 325, 336, 900)
         left, top, w, h = hook.gauge_lock_region(self.cfg, state, (0, 0, 1200, 400))
-        self.assertLessEqual(left, 850)
-        self.assertGreaterEqual(left + w, 951)
+        self.assertEqual((left, w), (0, 1200))   # toute la largeur : la zone verte bouge
         self.assertLessEqual(top, 325)
         self.assertGreaterEqual(top + h, 336)
 
@@ -92,17 +105,40 @@ class ControllerTest(unittest.TestCase):
         return self.ctrl.decide(self.det.detect(make_gauge(150, 250, yellow_x)))
 
     def test_left_of_zone_presses_right(self):
-        self.assertEqual(self.decide(100), "d")
+        self.assertEqual(self.decide(100)[0], "d")
 
     def test_right_of_zone_presses_left(self):
-        self.assertEqual(self.decide(300), "q")
+        self.assertEqual(self.decide(300)[0], "q")
 
     def test_centered_no_press(self):
         self.assertIsNone(self.decide(200))
 
+    def test_inside_zone_but_off_center_corrects(self):
+        """La ligne suit le centre de la zone, pas seulement ses bords."""
+        self.assertEqual(self.decide(240)[0], "q")
+        self.assertEqual(self.decide(160)[0], "d")
+
+    def test_longer_press_when_further(self):
+        lo, hi = self.cfg.press_duration
+        near = max(self.decide(170)[1] for _ in range(20))
+        far = min(self.decide(30)[1] for _ in range(20))
+        self.assertLess(near, far)
+        self.assertTrue(lo <= near <= hi and lo <= far <= hi)
+
     def test_invert(self):
         self.cfg.invert_controls = True
-        self.assertEqual(self.decide(100), "q")
+        self.assertEqual(self.decide(100)[0], "q")
+
+    def test_anticipates_moving_green_zone(self):
+        """Zone verte qui part vers la droite : la ligne au centre doit déjà
+        pousser à droite pour ne pas prendre de retard."""
+        state0 = hook.GaugeState(150, 250, 25, 36, 200)
+        state1 = hook.GaugeState(170, 270, 25, 36, 220)
+        self.ctrl.observe(state0, 0.0)
+        self.ctrl.observe(state1, 0.05)   # 400 px/s vers la droite
+        self.assertGreater(self.ctrl.velocity, 0)
+        self.assertGreater(self.ctrl.target(state1), 220)
+        self.assertEqual(self.ctrl.decide(state1)[0], "d")
 
 
 class BannerDetectorTest(unittest.TestCase):
