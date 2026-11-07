@@ -86,6 +86,9 @@ fishing. » déclenche la même chose.
 3. `Échap` **deux fois** (toujours deux, juste après l'achat) ;
 4. nouveau clic au centre de la case d'appât, puis sur **Switch** pour équiper l'appât.
 
+Si la case d'appât n'est pas affichée (après la bannière, ou après les deux `Échap`), le bot
+appuie sur `E` pour ouvrir la sélection d'appât avant de cliquer.
+
 Les boutons sont dans `templates/restock/`. Ils sont recadrés à l'intérieur du contour rose
 de survol, donc ils sont reconnus que la souris soit dessus ou non. La case d'appât est
 reconnue sur le carré « + » et le texte « Not Selected », pas sur le titre « Select Bait ».

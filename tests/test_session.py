@@ -370,12 +370,15 @@ class FakeShop:
     """Menus du jeu : chaque écran montre un bouton ; un clic dans sa zone
     cliquable (et seulement là) ou la bonne touche fait passer à l'écran suivant."""
 
-    CLICKS = {"slot_empty": "purchase1", "equip_banner": "purchase1",
+    CLICKS = {"slot_empty": "purchase1",
               "purchase1": "universal_bait", "universal_bait": "max_quantity",
               "max_quantity": "purchase2", "purchase2": "bought",
               "slot_empty2": "switch", "switch": "equipped"}
-    KEYS = {("idle", "f"): "equip_banner", ("bought", "esc"): "bought_esc",
-            ("bought_esc", "esc"): "slot_empty2"}
+    # Comme dans le jeu : la bannière n'ouvre pas le panneau, E l'ouvre, et les
+    # deux Échap après l'achat le referment.
+    KEYS = {("idle", "f"): "equip_banner", ("equip_banner", "e"): "slot_empty",
+            ("bought", "esc"): "bought_esc", ("bought_esc", "esc"): "panel_closed",
+            ("panel_closed", "e"): "slot_empty2"}
     IMAGE = {"slot_empty": "bait_slot_empty", "slot_empty2": "bait_slot_empty",
              "purchase1": "purchase", "purchase2": "purchase"}
 
@@ -410,7 +413,9 @@ class FakeShop:
         bx, by, bw, bh = self.button_box
         self.clicks.append(self.screen)
         self.events.append("clic " + self.screen)
-        if self.IMAGE.get(self.screen) == "bait_slot_empty" or self.screen == "equip_banner":
+        if self.screen not in self.CLICKS:
+            return             # rien de cliquable sur cet écran
+        if self.IMAGE.get(self.screen) == "bait_slot_empty":
             bh = bh * 0.7      # case d'appât : seul le carré « + » réagit, pas le texte
         if bx <= cx <= bx + bw and by <= cy <= by + bh:
             self.screen = self.CLICKS[self.screen]
@@ -422,7 +427,6 @@ class FakeShop:
         if self.screen == "equip_banner":
             h, w = self.banner.shape[:2]
             canvas[20:20 + h, 200:200 + w] = self.banner
-            name = "bait_slot_empty"
         if self.ghost_purchase and self.ghost_box and self.screen in (
                 "universal_bait", "max_quantity", "purchase2"):
             gx, gy, gw, gh = self.ghost_box
@@ -477,7 +481,8 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(record.outcome, "restock")
         self.assertEqual(self.shop.screen, "equipped")      # tout le parcours effectué
         self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
-        self.assertEqual(self.shop.keys, ["esc", "esc"])    # F jamais pressé : pas de pêche sans appât
+        # F jamais pressé (pas de pêche sans appât) ; E rouvre le panneau après les Échap.
+        self.assertEqual(self.shop.keys, ["esc", "esc", "e"])
 
     def test_two_escapes_right_after_purchase(self):
         self.shop.screen = "slot_empty"
@@ -519,7 +524,9 @@ class RestockTest(unittest.TestCase):
     def test_equip_bait_banner_triggers_restock(self):
         record = self.cycle()                               # F -> « Equip bait before fishing. »
         self.assertEqual(record.outcome, "restock")
-        self.assertEqual(self.shop.keys[0], "f")
+        # F, puis E car la bannière n'ouvre pas le panneau d'appât (cas du blocage).
+        self.assertEqual(self.shop.keys, ["f", "e", "esc", "esc", "e"])
+        self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
         self.assertEqual(self.shop.screen, "equipped")
 
     def test_own_escape_is_not_a_stop_request(self):
@@ -527,6 +534,30 @@ class RestockTest(unittest.TestCase):
         hook.tap("esc", (0.001, 0.001))
         self.assertGreater(hook._ignore_escape_until, hook.time.perf_counter())
         self.assertFalse(hook._escape_pressed())
+
+    def test_failure_does_not_wait_for_focus(self):
+        """Échec pendant que le jeu n'est plus au premier plan : arrêt immédiat,
+        sans attendre le jeu pour envoyer Échap (le « bloqué » du log)."""
+        class Game:
+            title = "NTE"
+            lost = False                              # passe en arrière-plan à l'échec
+
+            def is_foreground(self):
+                return not self.lost
+
+            def client_region(self):
+                return (0, 0, 1000, 1000)
+        game = Game()
+        hook.target = game
+        self.shop.screen = "idle_no_panel"           # case jamais visible, E sans effet
+        self.cfg.restock_step_timeout = 0.3
+        restocker = hook.Restocker(self.cfg)
+        restocker._save_failure = lambda *a: setattr(game, "lost", True)
+        started = hook.time.perf_counter()
+        with self.assertRaises(hook.RestockFailed):
+            restocker.run()
+        self.assertLess(hook.time.perf_counter() - started, 5)   # pas d'attente du jeu
+        self.assertEqual(self.shop.keys, ["e"])                  # aucun Échap hors du jeu
 
     def test_missing_button_aborts_and_closes_menus(self):
         self.shop.images.pop("switch")                      # bouton jamais affiché

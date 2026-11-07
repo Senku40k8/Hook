@@ -156,6 +156,7 @@ class Config:
     # Déclenché avant chaque cycle si la case d'appât est vide (« Not Selected »),
     # ou par la bannière « Equip bait before fishing ». Étapes : voir RESTOCK_STEPS.
     restock_enabled: bool = True
+    bait_menu_key: str = "e"                # ouvre la sélection d'appât (« Select Bait »)
     restock_dir: Path = TEMPLATES_DIR / "restock"
     no_bait_template: Path = TEMPLATES_DIR / "equip_bait_banner.png"
     restock_threshold: float = 0.80         # boutons texte (niveaux de gris)
@@ -1283,10 +1284,10 @@ TEMPLATE_THRESHOLDS: Dict[str, float] = {"bait_slot_empty": 0.88}
 CLICK_AREAS: Dict[str, Tuple[float, float, float, float]] = {
     "bait_slot_empty": (0.2, 0.1, 0.8, 0.65),
 }
-# Éléments dont l'aspect peut changer entre deux clics : si on ne les retrouve
-# pas, on reclique à leur position précédente. (Jamais pour « Purchase » : le
-# premier bouton peut rester visible derrière la boutique.)
-REUSE_POSITION = {"bait_slot_empty"}
+# La case d'appât est cherchée par Restocker.find_slot (ouverture avec E si
+# besoin, position précédente en dernier recours). Les autres boutons déjà
+# cliqués ne sont jamais recliqués au même endroit : le premier « Purchase »
+# peut rester visible derrière la boutique.
 
 
 def click_area(name: str, box: Region) -> Region:
@@ -1318,8 +1319,25 @@ class Restocker:
         """True si la case d'appât vide (« Not Selected ») est visible."""
         return self.buttons["bait_slot_empty"].detect(grab(search_region()))
 
+    def find_slot(self, before: Sequence[Region]) -> Region:
+        """Case d'appât vide : si elle n'est pas affichée, l'ouvre avec E."""
+        try:
+            return self.wait_for_button("bait_slot_empty", timeout=1.5, quiet=True)
+        except RestockFailed:
+            pass
+        log.info("  touche %s (ouvre la sélection d'appât)", self.cfg.bait_menu_key.upper())
+        tap(self.cfg.bait_menu_key, self.cfg.action_press_duration)
+        sleep(human.within(self.cfg.restock_step_delay))
+        try:
+            return self.wait_for_button("bait_slot_empty")
+        except RestockFailed:
+            if before:            # aspect changé après l'achat : position précédente
+                log.info("  case d'appât reprise à sa position précédente")
+                return before[-1]
+            raise
+
     def wait_for_button(self, name: str, timeout: Optional[float] = None,
-                        avoid: Sequence[Region] = ()) -> Region:
+                        avoid: Sequence[Region] = (), quiet: bool = False) -> Region:
         """Attend que le bouton soit visible et immobile (fin d'animation) ;
         renvoie son rectangle en coordonnées écran.
 
@@ -1359,7 +1377,8 @@ class Restocker:
             else:
                 previous = None
             sleep(0.08)
-        self._save_failure(name, frame, detector)
+        if not quiet:
+            self._save_failure(name, frame, detector)
         raise RestockFailed(f"bouton « {name} » introuvable")
 
     def _save_failure(self, name: str, frame: Optional[np.ndarray],
@@ -1388,13 +1407,8 @@ class Restocker:
                     tap(value, self.cfg.action_press_duration)
                     continue
                 before = clicked.get(value, [])
-                if before and value in REUSE_POSITION:
-                    # Case d'appât : son aspect peut avoir changé après l'achat ;
-                    # à défaut de la retrouver, on reclique à sa position.
-                    try:
-                        box = self.wait_for_button(value, timeout=2.0)
-                    except RestockFailed:
-                        box = before[-1]
+                if value == "bait_slot_empty":
+                    box = self.find_slot(before)
                 else:
                     # Bouton déjà cliqué (2e « Purchase ») : surtout pas le même.
                     box = self.wait_for_button(value, avoid=before)
@@ -1403,10 +1417,12 @@ class Restocker:
                 log.info("  clic sur %s", value)
                 click_box(click_area(value, box))
         except RestockFailed:
-            # Referme les menus restés ouverts avant d'abandonner.
+            # Referme les menus restés ouverts avant d'abandonner, mais seulement
+            # si le jeu est au premier plan (sinon on attendrait indéfiniment).
             for _ in range(2):
-                sleep(human.within((0.3, 0.6)))
-                tap("esc", self.cfg.action_press_duration)
+                time.sleep(human.within((0.3, 0.6)))
+                if target is None or target.is_foreground():
+                    tap("esc", self.cfg.action_press_duration)
             raise
         sleep(human.within((0.8, 1.5)))
         log.info("Appâts rachetés, reprise de la pêche.")
@@ -1779,7 +1795,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
 
         keyboard = make_keyboard(cfg.input_backend)
-        keyboard.prepare((cfg.key_action, cfg.key_left, cfg.key_right))
+        keyboard.prepare((cfg.key_action, cfg.key_left, cfg.key_right, cfg.bait_menu_key, "esc"))
         log.info("Envoi des touches : %s", keyboard.name)
 
         banner = BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)
