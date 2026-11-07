@@ -57,6 +57,30 @@ class GaugeDetectorTest(unittest.TestCase):
     def test_no_gauge(self):
         self.assertIsNone(self.detector.detect(np.full((60, 400, 3), 20, np.uint8)))
 
+    def test_search_ignores_green_scenery_without_yellow(self):
+        """Plein écran : une grande bande verte du décor (sans ligne jaune) est
+        ignorée au profit de la vraie jauge, plus petite mais avec indicateur."""
+        screen = np.full((400, 1200, 3), 20, np.uint8)
+        cv2.rectangle(screen, (50, 50), (650, 80), GREEN_BGR, -1)        # décor
+        screen[300:360, 700:1100] = make_gauge(150, 250, 200)             # jauge
+        state = self.detector.detect(screen, search=True)
+        self.assertIsNotNone(state)
+        self.assertAlmostEqual(state.green_left, 850, delta=2)
+        self.assertAlmostEqual(state.yellow_x, 900, delta=2)
+
+    def test_search_without_yellow_finds_nothing(self):
+        screen = np.full((400, 1200, 3), 20, np.uint8)
+        cv2.rectangle(screen, (50, 50), (650, 80), GREEN_BGR, -1)
+        self.assertIsNone(self.detector.detect(screen, search=True))
+
+    def test_gauge_lock_region_contains_bar(self):
+        state = hook.GaugeState(850, 951, 325, 336, 900)
+        left, top, w, h = hook.gauge_lock_region(self.cfg, state, (0, 0, 1200, 400))
+        self.assertLessEqual(left, 850)
+        self.assertGreaterEqual(left + w, 951)
+        self.assertLessEqual(top, 325)
+        self.assertGreaterEqual(top + h, 336)
+
 
 class ControllerTest(unittest.TestCase):
     def setUp(self):
@@ -103,8 +127,19 @@ class BannerDetectorTest(unittest.TestCase):
         screen[:] = (180, 140, 90)  # fond uniforme quelconque
         screen[100:100 + h, 150:150 + w] = tpl
         det = BannerDetector(TEMPLATE, 0.8, (0.9, 1.0, 1.1))
-        self.assertGreater(det.score(screen), 0.95)
+        score, box = det.locate(screen)
+        self.assertGreater(score, 0.95)
+        self.assertEqual(box[:2], (150, 100))
         self.assertLess(det.score(np.full_like(screen, 128)), 0.8)
+
+
+class ScreenCaptureTest(unittest.TestCase):
+    def test_grab_returns_bgr_image(self):
+        try:
+            frame = hook.grab((0, 0, 64, 32))
+        except Exception as exc:  # pas d'écran (CI, session distante)
+            self.skipTest(f"capture indisponible : {exc}")
+        self.assertEqual(frame.shape, (32, 64, 3))
 
 
 class SetupHelpersTest(unittest.TestCase):

@@ -16,10 +16,11 @@ Arrêt propre :
     - Ctrl+C dans le terminal.
 
 Usage :
-    python hook.py --setup            # réglage interactif des zones et couleurs (une fois)
-    python hook.py                    # lance la boucle
+    python hook.py                    # lance la boucle (zones détectées automatiquement)
     python hook.py --cycles 5         # s'arrête après 5 cycles
+    python hook.py --setup            # facultatif : réglage manuel des zones et couleurs
     python hook.py --calibrate        # capture + masques de debug pour vérifier le réglage
+    python hook.py --reset            # oublie les zones mémorisées
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 import cv2
+import mss
 import numpy as np
 import pyautogui
 
@@ -63,10 +65,12 @@ class Config:
     input_backend: str = "auto"
 
     # --- Zones de capture ----------------------------------------------------
-    # banner_region : None = écran entier (plus lent mais fonctionnel).
-    # gauge_region  : obligatoire pour la boucle (le décor contient du vert).
+    # None = recherche sur tout l'écran ; la zone est alors verrouillée
+    # automatiquement à la première détection et mémorisée dans hook_config.json.
     banner_region: Optional[Region] = None
     gauge_region: Optional[Region] = None
+    auto_lock_regions: bool = True
+    config_path: Optional[Path] = None      # où mémoriser les zones (non persisté)
 
     # --- Détection de la bannière (template matching) ----------------------
     banner_template: Path = Path(__file__).with_name("templates") / "fish_on_hook.png"
@@ -84,6 +88,10 @@ class Config:
     gauge_bridge_px: int = 15               # comble la coupure créée par la ligne jaune
     yellow_min_pixels: int = 6              # nb de pixels jaunes min. pour valider l'indicateur
     deadzone_ratio: float = 0.20            # marge intérieure (fraction de la largeur verte)
+    # Zone verrouillée autour de la jauge : barre verte ± max(N x sa largeur, min px).
+    gauge_lock_width_factor: float = 3.0
+    gauge_lock_min_half_width: int = 350
+    gauge_lock_vertical_pad: int = 40
 
     # --- Temporisations (secondes, bornes min/max des tirages aléatoires) ---
     start_delay: Range = (0.5, 1.5)         # après le premier F
@@ -292,10 +300,42 @@ def tap(key: str, duration: Range) -> None:
 # --------------------------------------------------------------------------- #
 # Capture d'écran
 # --------------------------------------------------------------------------- #
+_screen = None
+
+
+def _sct():
+    """Instance mss partagée (capture rapide, sans dépendre de Pillow)."""
+    global _screen
+    if _screen is None:
+        _screen = getattr(mss, "MSS", None)() if hasattr(mss, "MSS") else mss.mss()
+    return _screen
+
+
+def full_screen_region() -> Region:
+    """Zone couvrant l'écran principal."""
+    mon = _sct().monitors[1]
+    return mon["left"], mon["top"], mon["width"], mon["height"]
+
+
 def grab(region: Optional[Region] = None) -> np.ndarray:
     """Capture (une zone de) l'écran et renvoie une image BGR pour OpenCV."""
-    shot = pyautogui.screenshot(region=region)
-    return cv2.cvtColor(np.asarray(shot), cv2.COLOR_RGB2BGR)
+    left, top, width, height = region or full_screen_region()
+    shot = _sct().grab({"left": left, "top": top, "width": width, "height": height})
+    return cv2.cvtColor(np.asarray(shot), cv2.COLOR_BGRA2BGR)
+
+
+def clip_region(left: int, top: int, right: int, bottom: int, bounds: Region) -> Region:
+    """Rectangle (coordonnées écran) rogné aux limites de bounds, au format Region."""
+    bl, bt, bw, bh = bounds
+    left, top = max(left, bl), max(top, bt)
+    right, bottom = min(right, bl + bw), min(bottom, bt + bh)
+    return int(left), int(top), int(right - left), int(bottom - top)
+
+
+def remember_regions(cfg: Config) -> None:
+    """Mémorise les zones verrouillées pour les prochains lancements."""
+    if cfg.config_path is not None:
+        save_config_file(cfg, cfg.config_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -318,16 +358,21 @@ class BannerDetector:
             for s in scales
         ]
 
-    def score(self, frame_bgr: np.ndarray) -> float:
-        """Meilleur score de correspondance (0..1) sur toutes les échelles."""
+    def locate(self, frame_bgr: np.ndarray) -> Tuple[float, Optional[Region]]:
+        """Meilleur score (0..1) et rectangle (x, y, w, h) correspondant dans l'image."""
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        best = 0.0
+        best, box = 0.0, None
         for tpl in self.templates:
             if tpl.shape[0] > gray.shape[0] or tpl.shape[1] > gray.shape[1]:
                 continue
             result = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
-            best = max(best, float(result.max()))
-        return best
+            _, value, _, (x, y) = cv2.minMaxLoc(result)
+            if value > best:
+                best, box = float(value), (x, y, tpl.shape[1], tpl.shape[0])
+        return best, box
+
+    def score(self, frame_bgr: np.ndarray) -> float:
+        return self.locate(frame_bgr)[0]
 
     def detect(self, frame_bgr: np.ndarray) -> bool:
         return self.score(frame_bgr) >= self.threshold
@@ -363,35 +408,47 @@ class GaugeDetector:
         yellow = cv2.inRange(hsv, np.array(self.cfg.yellow_lower), np.array(self.cfg.yellow_upper))
         return hsv, green, yellow
 
-    def detect(self, frame_bgr: np.ndarray) -> Optional[GaugeState]:
+    def detect(self, frame_bgr: np.ndarray, search: bool = False) -> Optional[GaugeState]:
+        """Analyse une image de la jauge.
+
+        search=False : l'image est la zone de la jauge ; la ligne jaune est
+                       cherchée sur toute sa largeur.
+        search=True  : l'image est l'écran entier ; une barre verte n'est retenue
+                       que si une ligne jaune se trouve à proximité, pour ne pas
+                       confondre la jauge avec le vert du décor.
+        """
         cfg = self.cfg
         _, green, yellow = self.masks(frame_bgr)
+        frame_w = yellow.shape[1]
 
-        # 1) Zone verte : plus grand contour en forme de barre horizontale.
+        # 1) Zones vertes candidates : contours en forme de barre horizontale.
         contours, _ = cv2.findContours(green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best = None
+        candidates = []
         for c in contours:
             x, y, w, h = cv2.boundingRect(c)
             if w >= cfg.gauge_min_width and h > 0 and w / h >= cfg.gauge_min_aspect:
-                if best is None or w * h > best[2] * best[3]:
-                    best = (x, y, w, h)
-        if best is None:
-            return None
-        x, y, w, h = best
+                candidates.append((x, y, w, h))
+        candidates.sort(key=lambda b: b[2] * b[3], reverse=True)
 
-        # 2) Indicateur jaune : recherché sur toute la largeur, dans la bande
-        #    horizontale de la jauge (élargie verticalement car la ligne
-        #    dépasse souvent de la barre).
-        pad = max(3, h)
-        y0, y1 = max(0, y - pad), min(yellow.shape[0], y + h + pad)
-        band = yellow[y0:y1, :]
-        column_counts = np.count_nonzero(band, axis=0)
-        yellow_x = None
-        if column_counts.sum() >= cfg.yellow_min_pixels:
-            # Centre de masse horizontal des pixels jaunes.
-            yellow_x = int(round(np.average(np.arange(band.shape[1]), weights=column_counts)))
-
-        return GaugeState(x, x + w, y, y + h, yellow_x)
+        for x, y, w, h in candidates:
+            # 2) Indicateur jaune, dans la bande horizontale de la jauge
+            #    (élargie verticalement car la ligne dépasse souvent de la barre).
+            pad = max(3, h)
+            y0, y1 = max(0, y - pad), min(yellow.shape[0], y + h + pad)
+            if search:
+                x0 = max(0, x - 2 * w)
+                x1 = min(frame_w, x + 3 * w)
+            else:
+                x0, x1 = 0, frame_w
+            column_counts = np.count_nonzero(yellow[y0:y1, x0:x1], axis=0)
+            yellow_x = None
+            if column_counts.sum() >= cfg.yellow_min_pixels:
+                # Centre de masse horizontal des pixels jaunes.
+                yellow_x = x0 + int(round(np.average(np.arange(x1 - x0), weights=column_counts)))
+            if search and yellow_x is None:
+                continue  # barre verte sans indicateur : probablement le décor
+            return GaugeState(x, x + w, y, y + h, yellow_x)
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -436,13 +493,39 @@ class GaugeController:
 # --------------------------------------------------------------------------- #
 # Étapes du cycle
 # --------------------------------------------------------------------------- #
+def banner_lock_region(match: Region, frame_region: Region) -> Region:
+    """Zone de la bannière : rectangle trouvé + marge (tolérance de position/échelle)."""
+    mx, my, mw, mh = match
+    left, top = frame_region[0] + mx, frame_region[1] + my
+    pad_x, pad_y = int(mw * 0.15), mh
+    return clip_region(left - pad_x, top - pad_y, left + mw + pad_x, top + mh + pad_y,
+                       full_screen_region())
+
+
+def gauge_lock_region(cfg: Config, state: GaugeState, frame_region: Region) -> Region:
+    """Zone de la jauge : bande centrée sur la barre verte, assez large pour
+    couvrir tout le rail sur lequel la zone verte et la ligne jaune se déplacent."""
+    width = state.green_right - state.green_left
+    cx = frame_region[0] + (state.green_left + state.green_right) // 2
+    cy = frame_region[1] + (state.green_top + state.green_bottom) // 2
+    half_w = max(int(width * cfg.gauge_lock_width_factor), cfg.gauge_lock_min_half_width)
+    half_h = (state.green_bottom - state.green_top) // 2 + cfg.gauge_lock_vertical_pad
+    return clip_region(cx - half_w, cy - half_h, cx + half_w, cy + half_h, full_screen_region())
+
+
 def wait_for_banner(cfg: Config, detector: BannerDetector) -> bool:
     log.info("Attente de la bannière…")
     deadline = time.perf_counter() + cfg.banner_timeout
     while time.perf_counter() < deadline:
         check_stop()
-        if detector.detect(grab(cfg.banner_region)):
-            log.info("Bannière détectée.")
+        region = cfg.banner_region or full_screen_region()
+        score, box = detector.locate(grab(region))
+        if score >= detector.threshold:
+            log.info("Bannière détectée (score %.2f).", score)
+            if cfg.banner_region is None and cfg.auto_lock_regions and box:
+                cfg.banner_region = banner_lock_region(box, region)
+                remember_regions(cfg)
+                log.info("Zone de la bannière mémorisée : %s", cfg.banner_region)
             return True
         sleep(cfg.scan_interval)
     return False
@@ -453,8 +536,15 @@ def wait_for_gauge(cfg: Config, detector: GaugeDetector) -> bool:
     deadline = time.perf_counter() + cfg.gauge_appear_timeout
     while time.perf_counter() < deadline:
         check_stop()
-        if detector.detect(grab(cfg.gauge_region)) is not None:
+        searching = cfg.gauge_region is None
+        region = cfg.gauge_region or full_screen_region()
+        state = detector.detect(grab(region), search=searching)
+        if state is not None:
             log.info("Jauge détectée, début du suivi.")
+            if searching and cfg.auto_lock_regions:
+                cfg.gauge_region = gauge_lock_region(cfg, state, region)
+                remember_regions(cfg)
+                log.info("Zone de la jauge mémorisée : %s", cfg.gauge_region)
             return True
         sleep(cfg.scan_interval)
     return False
@@ -474,7 +564,7 @@ def track_gauge(cfg: Config, detector: GaugeDetector) -> None:
             log.warning("Durée max. de suivi atteinte, arrêt du suivi.")
             return
 
-        state = detector.detect(grab(cfg.gauge_region))
+        state = detector.detect(grab(cfg.gauge_region), search=cfg.gauge_region is None)
         frames += 1
         if state is None:
             lost_since = lost_since or now
@@ -602,7 +692,7 @@ def calibrate(cfg: Config, out_dir: Path) -> None:
     frame = grab(cfg.gauge_region)
     detector = GaugeDetector(cfg)
     _, green, yellow = detector.masks(frame)
-    state = detector.detect(frame)
+    state = detector.detect(frame, search=cfg.gauge_region is None)
     annotated = frame.copy()
     if state:
         cv2.rectangle(annotated, (state.green_left, state.green_top),
@@ -633,6 +723,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--setup", action="store_true",
                    help="réglage interactif des zones et couleurs, enregistré dans hook_config.json")
     p.add_argument("--calibrate", action="store_true", help="capture de vérification puis sortie")
+    p.add_argument("--reset", action="store_true",
+                   help="oublie les zones mémorisées (nouvelle détection automatique)")
     p.add_argument("--config", type=Path, default=CONFIG_FILE, help="fichier de réglages")
     p.add_argument("--banner-region", type=int, nargs=4, metavar=("L", "T", "W", "H"))
     p.add_argument("--gauge-region", type=int, nargs=4, metavar=("L", "T", "W", "H"))
@@ -645,9 +737,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> Config:
-    cfg = Config()
+    cfg = Config(config_path=args.config)
     if load_config_file(cfg, args.config):
         log.info("Réglages chargés depuis %s", args.config)
+    if args.reset:
+        cfg.banner_region = cfg.gauge_region = None
+        log.info("Zones oubliées : elles seront redétectées automatiquement.")
     # Les options en ligne de commande priment sur le fichier.
     if args.banner_region:
         cfg.banner_region = tuple(args.banner_region)
@@ -682,10 +777,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             calibrate(cfg, Path("debug"))
             return 0
 
-        if cfg.gauge_region is None:
-            log.error("Zone de la jauge non définie : lancez d'abord "
-                      "« python hook.py --setup » (ou passez --gauge-region L T W H).")
-            return 1
+        if cfg.gauge_region is None or cfg.banner_region is None:
+            log.info("Zones non mémorisées : recherche sur tout l'écran au premier cycle, "
+                     "puis verrouillage automatique.")
 
         keyboard = make_keyboard(cfg.input_backend)
         keyboard.prepare((cfg.key_action, cfg.key_left, cfg.key_right))
