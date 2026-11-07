@@ -13,7 +13,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hook import BannerDetector, Config, GaugeController, GaugeDetector  # noqa: E402
+import hook  # noqa: E402
+from hook import (  # noqa: E402
+    BannerDetector, Config, GaugeController, GaugeDetector,
+    hsv_range_from_sample, load_config_file, save_config_file, vivid_pixels,
+)
+
+TEMPLATE = Path(__file__).resolve().parents[1] / "templates" / "fish_on_hook.png"
 
 GREEN_BGR = (60, 200, 60)
 YELLOW_BGR = (0, 230, 255)
@@ -87,6 +93,68 @@ class BannerDetectorTest(unittest.TestCase):
             det = BannerDetector(path, 0.8, (1.0,))
             self.assertTrue(det.detect(screen))
             self.assertFalse(det.detect(np.full((300, 800, 3), 30, np.uint8)))
+
+    @unittest.skipUnless(TEMPLATE.exists(), "template absent")
+    def test_real_template_found_on_other_background(self):
+        """Le template réel (texte seul) est retrouvé sur un fond différent."""
+        tpl = cv2.imread(str(TEMPLATE))
+        h, w = tpl.shape[:2]
+        screen = np.zeros((h + 200, w + 300, 3), np.uint8)
+        screen[:] = (180, 140, 90)  # fond uniforme quelconque
+        screen[100:100 + h, 150:150 + w] = tpl
+        det = BannerDetector(TEMPLATE, 0.8, (0.9, 1.0, 1.1))
+        self.assertGreater(det.score(screen), 0.95)
+        self.assertLess(det.score(np.full_like(screen, 128)), 0.8)
+
+
+class SetupHelpersTest(unittest.TestCase):
+    def test_hsv_range_covers_sample(self):
+        sample = np.zeros((10, 10, 3), np.uint8)
+        sample[..., 0] = np.linspace(55, 65, 100).reshape(10, 10)
+        sample[..., 1] = 200
+        sample[..., 2] = 180
+        lower, upper = hsv_range_from_sample(sample)
+        self.assertLessEqual(lower[0], 55)
+        self.assertGreaterEqual(upper[0], 65)
+        self.assertLessEqual(lower[1], 200)
+        self.assertLessEqual(lower[2], 180)
+
+    def test_setup_ranges_detect_gauge(self):
+        """Plages mesurées comme dans --setup -> la jauge est détectée."""
+        img = make_gauge(150, 250, 120)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        cfg = Config()
+        cfg.green_lower, cfg.green_upper = hsv_range_from_sample(hsv[27:34, 160:240])
+        # Rectangle autour de la ligne jaune, qui contient aussi du gris et du fond.
+        cfg.yellow_lower, cfg.yellow_upper = hsv_range_from_sample(
+            vivid_pixels(hsv[15:45, 116:125]))
+        state = GaugeDetector(cfg).detect(img)
+        self.assertIsNotNone(state)
+        self.assertAlmostEqual(state.yellow_x, 120, delta=2)
+
+    def test_config_roundtrip(self):
+        cfg = Config()
+        cfg.gauge_region = (1, 2, 3, 4)
+        cfg.green_lower = (50, 60, 70)
+        cfg.invert_controls = True
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cfg.json"
+            save_config_file(cfg, path)
+            loaded = Config()
+            self.assertTrue(load_config_file(loaded, path))
+        self.assertEqual(loaded.gauge_region, (1, 2, 3, 4))
+        self.assertEqual(loaded.green_lower, (50, 60, 70))
+        self.assertIsNone(loaded.banner_region)
+        self.assertTrue(loaded.invert_controls)
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows uniquement")
+class ScancodeKeyboardTest(unittest.TestCase):
+    def test_scancodes_resolved(self):
+        kb = hook.ScancodeKeyboard()
+        codes = {k: kb.scancode(k) for k in "fqd"}
+        self.assertTrue(all(codes.values()))
+        self.assertEqual(len(set(codes.values())), 3)
 
 
 if __name__ == "__main__":

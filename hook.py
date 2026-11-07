@@ -16,16 +16,17 @@ Arrêt propre :
     - Ctrl+C dans le terminal.
 
 Usage :
+    python hook.py --setup            # réglage interactif des zones et couleurs (une fois)
     python hook.py                    # lance la boucle
     python hook.py --cycles 5         # s'arrête après 5 cycles
-    python hook.py --calibrate        # capture + masques de debug pour régler les couleurs
-    python hook.py --gauge-region 600 900 700 80 --banner-region 400 200 1100 200
+    python hook.py --calibrate        # capture + masques de debug pour vérifier le réglage
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import logging
 import random
 import sys
@@ -44,6 +45,8 @@ Region = Tuple[int, int, int, int]  # (left, top, width, height) en pixels écra
 HSV = Tuple[int, int, int]
 Range = Tuple[float, float]
 
+CONFIG_FILE = Path(__file__).with_name("hook_config.json")
+
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -56,9 +59,12 @@ class Config:
     key_right: str = "d"
     # Mettre à True si Q/D font bouger l'indicateur dans le sens opposé.
     invert_controls: bool = False
+    # "scancode" (SendInput, recommandé pour les jeux), "pyautogui" ou "auto".
+    input_backend: str = "auto"
 
-    # --- Zones de capture (None = écran principal entier) ------------------
-    # Restreindre ces zones accélère la capture et évite les faux positifs.
+    # --- Zones de capture ----------------------------------------------------
+    # banner_region : None = écran entier (plus lent mais fonctionnel).
+    # gauge_region  : obligatoire pour la boucle (le décor contient du vert).
     banner_region: Optional[Region] = None
     gauge_region: Optional[Region] = None
 
@@ -68,6 +74,7 @@ class Config:
     banner_scales: Tuple[float, ...] = (0.9, 1.0, 1.1)  # tolérance d'échelle
 
     # --- Détection de la jauge (seuillage HSV, échelle OpenCV H:0-179) -----
+    # Valeurs par défaut génériques : utiliser --setup pour les mesurer en jeu.
     green_lower: HSV = (40, 80, 80)
     green_upper: HSV = (85, 255, 255)
     yellow_lower: HSV = (20, 120, 150)
@@ -92,6 +99,31 @@ class Config:
     gauge_lost_grace: float = 0.6           # absence continue = jauge disparue
     gauge_max_duration: float = 120.0       # sécurité : durée max. du suivi
     scan_interval: float = 0.03             # pause entre deux captures en attente
+
+
+# Champs enregistrés dans hook_config.json (réglages propres à la machine).
+PERSISTED_FIELDS = (
+    "banner_region", "gauge_region",
+    "green_lower", "green_upper", "yellow_lower", "yellow_upper",
+    "invert_controls", "input_backend",
+)
+
+
+def load_config_file(cfg: Config, path: Path) -> bool:
+    """Applique les réglages enregistrés (s'ils existent) sur cfg."""
+    if not path.exists():
+        return False
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for name in PERSISTED_FIELDS:
+        if name in data:
+            value = data[name]
+            setattr(cfg, name, tuple(value) if isinstance(value, list) else value)
+    return True
+
+
+def save_config_file(cfg: Config, path: Path) -> None:
+    data = {name: getattr(cfg, name) for name in PERSISTED_FIELDS}
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -137,13 +169,123 @@ def rand(bounds: Range) -> float:
 # --------------------------------------------------------------------------- #
 # Entrées clavier
 # --------------------------------------------------------------------------- #
+class PyAutoGuiKeyboard:
+    """Touches virtuelles via PyAutoGUI (suffisant pour les applis classiques)."""
+
+    name = "pyautogui"
+
+    def prepare(self, keys: Sequence[str]) -> None:
+        pass
+
+    def down(self, key: str) -> None:
+        pyautogui.keyDown(key)
+
+    def up(self, key: str) -> None:
+        pyautogui.keyUp(key)
+
+
+if sys.platform == "win32":
+    from ctypes import wintypes
+
+    _ULONG_PTR = ctypes.c_size_t
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", _ULONG_PTR)]
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", _ULONG_PTR)]
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                    ("wParamH", wintypes.WORD)]
+
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT), ("hi", _HARDWAREINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+
+class ScancodeKeyboard:
+    """Touches matérielles via SendInput + scancodes (Windows).
+
+    Les jeux (DirectInput / Raw Input) ignorent souvent les touches virtuelles
+    de PyAutoGUI ; les scancodes sont reçus comme un vrai clavier. Le scancode
+    est calculé avec la disposition clavier active : "q" désigne donc bien la
+    touche marquée Q, en AZERTY comme en QWERTY.
+    """
+
+    name = "scancode"
+    _INPUT_KEYBOARD = 1
+    _KEYEVENTF_KEYUP = 0x0002
+    _KEYEVENTF_SCANCODE = 0x0008
+    _MAPVK_VK_TO_VSC = 0
+
+    def __init__(self) -> None:
+        if sys.platform != "win32":
+            raise OSError("Le mode scancode n'est disponible que sous Windows.")
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        u32.VkKeyScanW.argtypes = [wintypes.WCHAR]
+        u32.VkKeyScanW.restype = ctypes.c_short
+        u32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        u32.MapVirtualKeyW.restype = wintypes.UINT
+        u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+        u32.SendInput.restype = wintypes.UINT
+        self._u32 = u32
+        self._codes: dict[str, int] = {}
+
+    def scancode(self, key: str) -> int:
+        if key not in self._codes:
+            if len(key) != 1:
+                raise ValueError(f"Touche non gérée en mode scancode : {key!r}")
+            vk = self._u32.VkKeyScanW(key)
+            if vk == -1:
+                raise ValueError(f"Touche absente de la disposition clavier : {key!r}")
+            sc = self._u32.MapVirtualKeyW(vk & 0xFF, self._MAPVK_VK_TO_VSC)
+            if sc == 0:
+                raise ValueError(f"Pas de scancode pour la touche {key!r}")
+            self._codes[key] = sc
+        return self._codes[key]
+
+    def prepare(self, keys: Sequence[str]) -> None:
+        for key in keys:
+            log.debug("Touche %s -> scancode 0x%02X", key.upper(), self.scancode(key))
+
+    def _send(self, key: str, flags: int) -> None:
+        inp = _INPUT(type=self._INPUT_KEYBOARD)
+        inp.ki = _KEYBDINPUT(0, self.scancode(key), self._KEYEVENTF_SCANCODE | flags, 0, 0)
+        if self._u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) != 1:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def down(self, key: str) -> None:
+        self._send(key, 0)
+
+    def up(self, key: str) -> None:
+        self._send(key, self._KEYEVENTF_KEYUP)
+
+
+def make_keyboard(backend: str):
+    if backend == "pyautogui" or (backend == "auto" and sys.platform != "win32"):
+        return PyAutoGuiKeyboard()
+    return ScancodeKeyboard()
+
+
+# Clavier actif (remplacé dans main() selon la configuration).
+keyboard = PyAutoGuiKeyboard()
+
+
 def tap(key: str, duration: Range) -> None:
     """Pression courte d'une touche, durée de maintien aléatoire."""
-    pyautogui.keyDown(key)
+    keyboard.down(key)
     try:
         sleep(rand(duration))
     finally:
-        pyautogui.keyUp(key)  # relâche la touche même en cas d'interruption
+        keyboard.up(key)  # relâche la touche même en cas d'interruption
 
 
 # --------------------------------------------------------------------------- #
@@ -166,7 +308,7 @@ class BannerDetector:
         if template is None:
             raise FileNotFoundError(
                 f"Template introuvable : {template_path}\n"
-                "Faites une capture de la bannière (voir README, section Calibration)."
+                "Faites une capture du texte de la bannière (voir README)."
             )
         self.threshold = threshold
         self.templates = [
@@ -365,10 +507,93 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector) -> None
 
 
 # --------------------------------------------------------------------------- #
-# Calibration
+# Réglage interactif (--setup)
+# --------------------------------------------------------------------------- #
+def hsv_range_from_sample(hsv_pixels: np.ndarray, h_margin: int = 6,
+                          sv_margin: int = 40) -> Tuple[HSV, HSV]:
+    """Plage HSV couvrant un échantillon de pixels (percentiles 2-98 + marge)."""
+    px = hsv_pixels.reshape(-1, 3).astype(int)
+    lo = np.percentile(px, 2, axis=0)
+    hi = np.percentile(px, 98, axis=0)
+    lower = (max(0, int(lo[0]) - h_margin), max(0, int(lo[1]) - sv_margin),
+             max(0, int(lo[2]) - sv_margin))
+    upper = (min(179, int(hi[0]) + h_margin), 255, 255)
+    return lower, upper
+
+
+def vivid_pixels(hsv_pixels: np.ndarray, keep_ratio: float = 0.2) -> np.ndarray:
+    """Garde les pixels les plus saturés/lumineux (ex. la fine ligne jaune
+    au milieu d'un rectangle qui contient aussi du vert ou du gris)."""
+    px = hsv_pixels.reshape(-1, 3)
+    score = px[:, 1].astype(int) + px[:, 2].astype(int)
+    threshold = np.percentile(score, 100 * (1 - keep_ratio))
+    return px[score >= threshold]
+
+
+def select_box(title: str, image: np.ndarray) -> Optional[Region]:
+    """Rectangle tracé à la souris (Entrée/Espace = valider, C = ignorer)."""
+    print(f"\n>>> {title}\n    Tracez un rectangle puis Entrée (C pour ignorer).")
+    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+    x, y, w, h = cv2.selectROI(title, image, showCrosshair=True, fromCenter=False)
+    cv2.destroyWindow(title)
+    if w == 0 or h == 0:
+        return None
+    return int(x), int(y), int(w), int(h)
+
+
+def setup(cfg: Config, path: Path) -> int:
+    """Capture l'écran avec la jauge visible, fait tracer les zones et mesure les couleurs."""
+    log.info("Affichez la jauge à l'écran : capture dans %.0f s…", cfg.startup_countdown)
+    sleep(cfg.startup_countdown)
+    screen = grab()
+
+    banner_region = select_box("1/4 - Zone ou apparait la banniere (C = ecran entier)", screen)
+    gauge_region = select_box("2/4 - Zone de la jauge (un peu plus large que la barre)", screen)
+    if gauge_region is None:
+        log.error("La zone de la jauge est obligatoire, réglage annulé.")
+        return 1
+
+    gx, gy, gw, gh = gauge_region
+    gauge_img = screen[gy:gy + gh, gx:gx + gw]
+    hsv = cv2.cvtColor(gauge_img, cv2.COLOR_BGR2HSV)
+
+    green_box = select_box("3/4 - Rectangle a l'interieur de la zone verte", gauge_img)
+    yellow_box = select_box("4/4 - Rectangle serre autour de la ligne jaune", gauge_img)
+
+    cfg.banner_region = banner_region
+    cfg.gauge_region = gauge_region
+    if green_box:
+        x, y, w, h = green_box
+        cfg.green_lower, cfg.green_upper = hsv_range_from_sample(hsv[y:y + h, x:x + w])
+    else:
+        log.warning("Zone verte ignorée : couleurs par défaut conservées.")
+    if yellow_box:
+        x, y, w, h = yellow_box
+        cfg.yellow_lower, cfg.yellow_upper = hsv_range_from_sample(
+            vivid_pixels(hsv[y:y + h, x:x + w]))
+    else:
+        log.warning("Ligne jaune ignorée : couleurs par défaut conservées.")
+
+    save_config_file(cfg, path)
+    log.info("Réglages enregistrés dans %s", path)
+    log.info("Vert  : %s -> %s", cfg.green_lower, cfg.green_upper)
+    log.info("Jaune : %s -> %s", cfg.yellow_lower, cfg.yellow_upper)
+
+    # Vérification immédiate sur la capture.
+    state = GaugeDetector(cfg).detect(gauge_img)
+    if state is None or state.yellow_x is None:
+        log.warning("Vérification : jauge ou ligne jaune non détectée (%s). "
+                    "Relancez --setup ou contrôlez avec --calibrate.", state)
+    else:
+        log.info("Vérification OK : %s", state)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Calibration (vérification visuelle)
 # --------------------------------------------------------------------------- #
 def calibrate(cfg: Config, out_dir: Path) -> None:
-    """Enregistre capture, masques et image annotée pour régler seuils et zones."""
+    """Enregistre capture, masques et image annotée pour vérifier seuils et zones."""
     out_dir.mkdir(parents=True, exist_ok=True)
     full = grab()
     cv2.imwrite(str(out_dir / "screen.png"), full)
@@ -404,17 +629,25 @@ def calibrate(cfg: Config, out_dir: Path) -> None:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Boucle de test d'interface (séquence pêche).")
     p.add_argument("--cycles", type=int, default=0, help="nombre de cycles (0 = infini)")
-    p.add_argument("--calibrate", action="store_true", help="capture de calibration puis sortie")
+    p.add_argument("--setup", action="store_true",
+                   help="réglage interactif des zones et couleurs, enregistré dans hook_config.json")
+    p.add_argument("--calibrate", action="store_true", help="capture de vérification puis sortie")
+    p.add_argument("--config", type=Path, default=CONFIG_FILE, help="fichier de réglages")
     p.add_argument("--banner-region", type=int, nargs=4, metavar=("L", "T", "W", "H"))
     p.add_argument("--gauge-region", type=int, nargs=4, metavar=("L", "T", "W", "H"))
     p.add_argument("--template", type=Path, help="image de la bannière")
     p.add_argument("--invert", action="store_true", help="inverse Q et D")
+    p.add_argument("--input", choices=("auto", "scancode", "pyautogui"),
+                   help="méthode d'envoi des touches (auto = scancode sous Windows)")
     p.add_argument("-v", "--verbose", action="store_true", help="logs détaillés")
     return p.parse_args(argv)
 
 
 def build_config(args: argparse.Namespace) -> Config:
     cfg = Config()
+    if load_config_file(cfg, args.config):
+        log.info("Réglages chargés depuis %s", args.config)
+    # Les options en ligne de commande priment sur le fichier.
     if args.banner_region:
         cfg.banner_region = tuple(args.banner_region)
     if args.gauge_region:
@@ -423,10 +656,13 @@ def build_config(args: argparse.Namespace) -> Config:
         cfg.banner_template = args.template
     if args.invert:
         cfg.invert_controls = True
+    if args.input:
+        cfg.input_backend = args.input
     return cfg
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    global keyboard
     args = parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -439,9 +675,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pyautogui.PAUSE = 0         # les délais sont gérés explicitement
 
     try:
+        if args.setup:
+            return setup(cfg, args.config)
         if args.calibrate:
             calibrate(cfg, Path("debug"))
             return 0
+
+        if cfg.gauge_region is None:
+            log.error("Zone de la jauge non définie : lancez d'abord "
+                      "« python hook.py --setup » (ou passez --gauge-region L T W H).")
+            return 1
+
+        keyboard = make_keyboard(cfg.input_backend)
+        keyboard.prepare((cfg.key_action, cfg.key_left, cfg.key_right))
+        log.info("Envoi des touches : %s", keyboard.name)
 
         banner = BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)
         gauge = GaugeDetector(cfg)
@@ -464,14 +711,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log.info("Arrêt : fail-safe PyAutoGUI (souris dans un coin).")
     except KeyboardInterrupt:
         log.info("Arrêt : Ctrl+C.")
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError, OSError) as exc:
         log.error("%s", exc)
         return 1
     finally:
         # Sécurité : aucune touche ne doit rester enfoncée.
         for key in (cfg.key_action, cfg.key_left, cfg.key_right):
             try:
-                pyautogui.keyUp(key)
+                keyboard.up(key)
             except Exception:
                 pass
     return 0
