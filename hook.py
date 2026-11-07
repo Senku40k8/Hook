@@ -13,8 +13,9 @@ Cycle exécuté en boucle :
 
 Plus d'appâts (case « Not Selected » avant un cycle, ou bannière « Equip bait
 before fishing ») : achat et équipement automatiques via les menus du jeu
-(case d'appât, Purchase, Universal Bait, quantité max., Purchase, Échap x2,
-case d'appât, Switch), avec des gestes de souris naturels.
+(Switch Bait par la case d'appât ou E, Purchase, Universal Bait, quantité
+max., Purchase, Échap x2, Switch Bait, Switch, Start Fishing si affiché), avec
+des gestes de souris naturels.
 
 Comportement humain (module session.py) : temps de réaction réalistes, fatigue,
 petites imperfections, sessions de 20-45 min entrecoupées de pauses de 5-15 min.
@@ -1263,17 +1264,23 @@ def wait_for_result(cfg: Config, results: MessageDetector) -> str:
 # --------------------------------------------------------------------------- #
 # Réapprovisionnement en appâts
 # --------------------------------------------------------------------------- #
-# (action, valeur) : "key" = touche à presser, "click" = bouton (templates/restock/<nom>.png)
+# (action, valeur) :
+#   "key"         touche à presser
+#   "click"       bouton à cliquer (templates/restock/<nom>.png), obligatoire
+#   "bait_dialog" ouvre la fenêtre « Switch Bait » : clic sur la case d'appât si
+#                 le panneau « Fishing Preparations » est affiché, sinon touche E
+#   "optional"    bouton cliqué seulement s'il est affiché
 RESTOCK_STEPS: Tuple[Tuple[str, str], ...] = (
-    ("click", "bait_slot_empty"),   # case d'appât vide (« Not Selected »)
-    ("click", "purchase"),          # ouvre l'achat d'appâts
-    ("click", "universal_bait"),    # Universal Bait à 5 coquillages
-    ("click", "max_quantity"),      # double chevron : quantité maximale
-    ("click", "purchase"),          # achat
+    ("bait_dialog", "bait_slot_empty"),  # fenêtre « Switch Bait »
+    ("click", "purchase"),               # ouvre l'achat d'appâts
+    ("click", "universal_bait"),         # Universal Bait à 5 coquillages
+    ("click", "max_quantity"),           # double chevron : quantité maximale
+    ("click", "purchase"),               # achat
     ("key", "esc"),
     ("key", "esc"),
-    ("click", "bait_slot_empty"),   # de nouveau la case d'appât…
-    ("click", "switch"),            # … pour équiper l'appât acheté
+    ("bait_dialog", "bait_slot_empty"),  # de nouveau « Switch Bait »…
+    ("click", "switch"),                 # … pour équiper l'appât acheté
+    ("optional", "start_fishing"),       # panneau « Fishing Preparations » encore ouvert
 )
 ICON_TEMPLATES: set = set()     # modèles comparés par contours (icônes à couleur variable)
 # Seuils plus stricts : la case vide ne doit jamais être confondue avec une case
@@ -1308,7 +1315,7 @@ class Restocker:
         self.cfg = cfg
         self.buttons: Dict[str, BannerDetector] = {}
         for action, name in RESTOCK_STEPS:
-            if action == "click":
+            if action != "key":
                 icon = name in ICON_TEMPLATES
                 threshold = TEMPLATE_THRESHOLDS.get(
                     name, cfg.restock_icon_threshold if icon else cfg.restock_threshold)
@@ -1319,22 +1326,19 @@ class Restocker:
         """True si la case d'appât vide (« Not Selected ») est visible."""
         return self.buttons["bait_slot_empty"].detect(grab(search_region()))
 
-    def find_slot(self, before: Sequence[Region]) -> Region:
-        """Case d'appât vide : si elle n'est pas affichée, l'ouvre avec E."""
+    def open_bait_dialog(self) -> None:
+        """Ouvre la fenêtre « Switch Bait » : clic sur la case d'appât vide si le
+        panneau « Fishing Preparations » est affiché, sinon touche E (en mode
+        pêche, E ouvre directement cette fenêtre)."""
         try:
-            return self.wait_for_button("bait_slot_empty", timeout=1.5, quiet=True)
+            box = self.wait_for_button("bait_slot_empty", timeout=1.0, quiet=True)
         except RestockFailed:
-            pass
-        log.info("  touche %s (ouvre la sélection d'appât)", self.cfg.bait_menu_key.upper())
-        tap(self.cfg.bait_menu_key, self.cfg.action_press_duration)
-        sleep(human.within(self.cfg.restock_step_delay))
-        try:
-            return self.wait_for_button("bait_slot_empty")
-        except RestockFailed:
-            if before:            # aspect changé après l'achat : position précédente
-                log.info("  case d'appât reprise à sa position précédente")
-                return before[-1]
-            raise
+            log.info("  touche %s (fenêtre « Switch Bait »)", self.cfg.bait_menu_key.upper())
+            tap(self.cfg.bait_menu_key, self.cfg.action_press_duration)
+            return
+        sleep(human.reaction())
+        log.info("  clic sur la case d'appât")
+        click_box(click_area("bait_slot_empty", box))
 
     def wait_for_button(self, name: str, timeout: Optional[float] = None,
                         avoid: Sequence[Region] = (), quiet: bool = False) -> Region:
@@ -1406,9 +1410,15 @@ class Restocker:
                     log.info("  touche %s", value.upper())
                     tap(value, self.cfg.action_press_duration)
                     continue
+                if action == "bait_dialog":
+                    self.open_bait_dialog()
+                    continue
                 before = clicked.get(value, [])
-                if value == "bait_slot_empty":
-                    box = self.find_slot(before)
+                if action == "optional":
+                    try:
+                        box = self.wait_for_button(value, timeout=2.0, quiet=True)
+                    except RestockFailed:
+                        continue          # pas affiché : rien à faire
                 else:
                     # Bouton déjà cliqué (2e « Purchase ») : surtout pas le même.
                     box = self.wait_for_button(value, avoid=before)

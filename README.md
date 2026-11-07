@@ -80,14 +80,16 @@ Activé par défaut (`--robotic` pour le désactiver) :
 équipe des appâts tout seul, puis reprend la pêche. La bannière « Equip bait before
 fishing. » déclenche la même chose.
 
-1. clic au centre de la case d'appât vide, puis sur **Purchase** ;
+1. ouverture de la fenêtre **Switch Bait**, puis clic sur **Purchase** ;
 2. clic sur **Universal Bait** (celui à 5 coquillages), sur le **double chevron** (quantité
    maximale), puis sur **Purchase** ;
 3. `Échap` **deux fois** (toujours deux, juste après l'achat) ;
-4. nouveau clic au centre de la case d'appât, puis sur **Switch** pour équiper l'appât.
+4. nouvelle ouverture de **Switch Bait**, puis clic sur **Switch** pour équiper l'appât ;
+5. clic sur **Start Fishing** si le panneau « Fishing Preparations » est encore affiché.
 
-Si la case d'appât n'est pas affichée (après la bannière, ou après les deux `Échap`), le bot
-appuie sur `E` pour ouvrir la sélection d'appât avant de cliquer.
+Pour ouvrir **Switch Bait**, le bot clique au centre de la case d'appât vide si le panneau
+« Fishing Preparations » est affiché. Sinon, en mode pêche, il appuie sur `E`, qui ouvre
+directement cette fenêtre.
 
 Les boutons sont dans `templates/restock/`. Ils sont recadrés à l'intérieur du contour rose
 de survol, donc ils sont reconnus que la souris soit dessus ou non. La case d'appât est

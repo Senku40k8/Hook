@@ -370,16 +370,19 @@ class FakeShop:
     """Menus du jeu : chaque écran montre un bouton ; un clic dans sa zone
     cliquable (et seulement là) ou la bonne touche fait passer à l'écran suivant."""
 
+    # Comme dans le jeu (captures du 07/11) :
+    # - panneau « Fishing Preparations » : clic sur la case vide -> « Switch Bait » ;
+    # - en mode pêche, E ouvre directement « Switch Bait » (Cancel / Purchase) ;
+    # - la bannière « Equip bait » n'ouvre rien ;
+    # - après « Switch », le panneau propose « Start Fishing ».
     CLICKS = {"slot_empty": "purchase1",
               "purchase1": "universal_bait", "universal_bait": "max_quantity",
               "max_quantity": "purchase2", "purchase2": "bought",
-              "slot_empty2": "switch", "switch": "equipped"}
-    # Comme dans le jeu : la bannière n'ouvre pas le panneau, E l'ouvre, et les
-    # deux Échap après l'achat le referment.
-    KEYS = {("idle", "f"): "equip_banner", ("equip_banner", "e"): "slot_empty",
-            ("bought", "esc"): "bought_esc", ("bought_esc", "esc"): "panel_closed",
-            ("panel_closed", "e"): "slot_empty2"}
-    IMAGE = {"slot_empty": "bait_slot_empty", "slot_empty2": "bait_slot_empty",
+              "switch": "start_fishing", "start_fishing": "equipped"}
+    KEYS = {("idle", "f"): "equip_banner", ("equip_banner", "e"): "purchase1",
+            ("bought", "esc"): "bought_esc", ("bought_esc", "esc"): "fishing_mode",
+            ("fishing_mode", "e"): "switch"}
+    IMAGE = {"slot_empty": "bait_slot_empty",
              "purchase1": "purchase", "purchase2": "purchase"}
 
     def __init__(self, ghost_purchase=False):
@@ -442,10 +445,25 @@ class FakeShop:
         return canvas
 
 
+PREPARATIONS = ROOT / "templates" / "originals" / "fishing preparations.jpg"
+
+
+@unittest.skipUnless(PREPARATIONS.exists(), "capture de référence absente")
+class RealScreenshotTest(unittest.TestCase):
+    """Sur une vraie capture du panneau « Fishing Preparations » (07/11) : la case
+    vide et « Start Fishing » sont reconnues, aucun autre bouton ne l'est."""
+
+    def test_fishing_preparations_panel(self):
+        img = cv2.imread(str(PREPARATIONS))
+        restocker = hook.Restocker(hook.Config())
+        found = {name for name, det in restocker.buttons.items() if det.detect(img)}
+        self.assertEqual(found, {"bait_slot_empty", "start_fishing"})
+
+
 @unittest.skipUnless(RESTOCK_DIR.is_dir() and EQUIP_BANNER.exists(), "templates absents")
 class RestockTest(unittest.TestCase):
     EXPECTED_CLICKS = ["slot_empty", "purchase1", "universal_bait", "max_quantity",
-                       "purchase2", "slot_empty2", "switch"]
+                       "purchase2", "switch", "start_fishing"]
 
     def setUp(self):
         self.shop = FakeShop()
@@ -524,9 +542,10 @@ class RestockTest(unittest.TestCase):
     def test_equip_bait_banner_triggers_restock(self):
         record = self.cycle()                               # F -> « Equip bait before fishing. »
         self.assertEqual(record.outcome, "restock")
-        # F, puis E car la bannière n'ouvre pas le panneau d'appât (cas du blocage).
+        # F, puis E qui ouvre directement « Switch Bait » (cas du blocage) : pas de
+        # case à cliquer, on enchaîne sur Purchase.
         self.assertEqual(self.shop.keys, ["f", "e", "esc", "esc", "e"])
-        self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS)
+        self.assertEqual(self.shop.clicks, self.EXPECTED_CLICKS[1:])
         self.assertEqual(self.shop.screen, "equipped")
 
     def test_own_escape_is_not_a_stop_request(self):
