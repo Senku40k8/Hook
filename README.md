@@ -15,8 +15,10 @@ pip install -r requirements.txt
 
 ## Utilisation
 
-Aucun réglage préalable n'est nécessaire : lancez le bot, puis **cliquez dans la fenêtre du
-jeu**. Le bot démarre une seconde après et ne travaille que dans cette fenêtre :
+Aucun réglage préalable n'est nécessaire. Au **premier lancement**, cliquez dans la fenêtre
+du jeu : son titre est mémorisé. Aux lancements suivants, le bot met lui-même le jeu au
+premier plan (pas besoin d'Alt+Tab). La barre des tâches et le sélecteur Alt+Tab sont
+ignorés pendant le choix. Le bot ne travaille ensuite que dans cette fenêtre :
 
 - la bannière et la jauge ne sont cherchées qu'à l'intérieur (une image visible dans un autre
   programme ne peut pas déclencher le bot) ;
@@ -29,7 +31,8 @@ jeu**. Le bot démarre une seconde après et ne travaille que dans cette fenêtr
 
 ```bash
 python hook.py                       # boucle infinie
-python hook.py --window "Nom du jeu" # cible la fenêtre par son titre
+python hook.py --list-windows        # titres des fenêtres ouvertes
+python hook.py --window "Nom du jeu" # cible la fenêtre par son titre (et le mémorise)
 python hook.py --cycles 10 -v        # 10 cycles, logs détaillés
 python hook.py --invert              # si Q/D agissent dans le sens opposé
 python hook.py --input pyautogui     # touches via PyAutoGUI au lieu des scancodes

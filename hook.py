@@ -70,6 +70,9 @@ class Config:
     banner_region: Optional[Region] = None
     gauge_region: Optional[Region] = None
     auto_lock_regions: bool = True
+    # Titre de la fenêtre du jeu : mémorisé au premier lancement, le bot la met
+    # ensuite lui-même au premier plan.
+    window_title: Optional[str] = None
     config_path: Optional[Path] = None      # où mémoriser les zones (non persisté)
 
     # --- Détection de la bannière (template matching) ----------------------
@@ -115,7 +118,7 @@ class Config:
 PERSISTED_FIELDS = (
     "banner_region", "gauge_region",
     "green_lower", "green_upper", "yellow_lower", "yellow_upper",
-    "invert_controls", "input_backend",
+    "invert_controls", "input_backend", "window_title",
 )
 
 
@@ -334,23 +337,72 @@ class GameWindow:
         return buf.value
 
     @classmethod
-    def find(cls, title_part: str) -> Optional["GameWindow"]:
-        """Première fenêtre visible dont le titre contient title_part (sans casse)."""
+    def class_name(cls, hwnd: int) -> str:
+        buf = ctypes.create_unicode_buffer(256)
+        cls._user32().GetClassNameW(wintypes.HWND(hwnd), buf, 256)
+        return buf.value
+
+    # Fenêtres du shell qui passent au premier plan pendant un changement de
+    # fenêtre (barre des tâches, Alt+Tab, Win+Tab, bureau) : jamais le jeu.
+    SHELL_CLASSES = {
+        "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "MultitaskingViewFrame",
+        "XamlExplorerHostIslandWindow", "ForegroundStaging", "TaskSwitcherWnd",
+        "Progman", "WorkerW", "Windows.UI.Core.CoreWindow",
+    }
+
+    @classmethod
+    def is_candidate(cls, hwnd: int) -> bool:
+        """Fenêtre d'application : visible et hors shell Windows."""
+        return bool(hwnd) and bool(cls._user32().IsWindowVisible(wintypes.HWND(hwnd))) \
+            and cls.class_name(hwnd) not in cls.SHELL_CLASSES
+
+    @classmethod
+    def list_windows(cls) -> list[int]:
+        """Fenêtres d'application visibles ayant un titre."""
         u32 = cls._user32()
         found: list[int] = []
         proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         def callback(hwnd, _):
-            if u32.IsWindowVisible(hwnd) and title_part.lower() in cls.window_title(hwnd).lower():
+            if cls.is_candidate(hwnd) and cls.window_title(hwnd).strip():
                 found.append(hwnd)
-                return False
             return True
 
         u32.EnumWindows(proc(callback), 0)
-        return cls(found[0]) if found else None
+        return found
+
+    @classmethod
+    def find(cls, title: str) -> Optional["GameWindow"]:
+        """Fenêtre au titre exact, sinon première dont le titre le contient (sans casse)."""
+        windows = cls.list_windows()
+        for hwnd in windows:
+            if cls.window_title(hwnd) == title:
+                return cls(hwnd)
+        for hwnd in windows:
+            if title.lower() in cls.window_title(hwnd).lower():
+                return cls(hwnd)
+        return None
 
     def is_foreground(self) -> bool:
         return self.foreground_hwnd() == self.hwnd
+
+    def activate(self, timeout: float = 3.0) -> bool:
+        """Met la fenêtre au premier plan (restaure si réduite)."""
+        u32 = self._user32()
+        hwnd = wintypes.HWND(self.hwnd)
+        if u32.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        # Windows refuse SetForegroundWindow à un programme en arrière-plan, sauf
+        # juste après une entrée clavier : un appui sur Alt lève ce verrou.
+        u32.keybd_event(0x12, 0, 0, 0)
+        u32.keybd_event(0x12, 0, 0x0002, 0)
+        u32.SetForegroundWindow(hwnd)
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            if self.is_foreground():
+                return True
+            sleep(0.05)
+        return False
 
     def client_region(self) -> Optional[Region]:
         """Zone client (sans bordures ni barre de titre) en coordonnées écran."""
@@ -409,22 +461,46 @@ def wait_for_focus() -> None:
     sleep(0.5)
 
 
-def pick_target(window_title: Optional[str], settle: float) -> GameWindow:
-    """Fenêtre du jeu : par titre, sinon la prochaine fenêtre cliquée."""
-    if window_title:
-        window = GameWindow.find(window_title)
-        if window is None:
-            raise ValueError(f"Aucune fenêtre visible dont le titre contient « {window_title} ».")
-        log.info("Fenêtre du jeu : « %s ». Mettez-la au premier plan.", window.title)
-        while not window.is_foreground():
-            sleep(0.1)
+def wait_for_clicked_window(stable_for: float = 0.5) -> GameWindow:
+    """Attend qu'une autre application que le terminal passe au premier plan et
+    y reste stable_for secondes (ignore barre des tâches, Alt+Tab, etc.)."""
+    start = GameWindow.foreground_hwnd()
+    candidate, since = 0, 0.0
+    while True:
+        hwnd = GameWindow.foreground_hwnd()
+        if hwnd != start and GameWindow.is_candidate(hwnd):
+            if hwnd != candidate:
+                candidate, since = hwnd, time.perf_counter()
+            elif time.perf_counter() - since >= stable_for:
+                return GameWindow(hwnd)
+        else:
+            candidate = 0
+        sleep(0.05)
+
+
+def pick_target(cfg: Config, settle: float) -> GameWindow:
+    """Fenêtre du jeu : retrouvée par son titre et activée par le bot, sinon
+    choisie en cliquant dessus (son titre est alors mémorisé)."""
+    window = GameWindow.find(cfg.window_title) if cfg.window_title else None
+    if cfg.window_title and window is None:
+        log.warning("Fenêtre « %s » introuvable (jeu fermé ?).", cfg.window_title)
+
+    if window is not None:
+        log.info("Fenêtre du jeu : « %s », mise au premier plan…", window.title)
+        if not window.activate():
+            log.warning("Windows a refusé la mise au premier plan : cliquez dans le jeu.")
+            while not window.is_foreground():
+                sleep(0.1)
     else:
-        start = GameWindow.foreground_hwnd()
         log.info("Cliquez dans la fenêtre du jeu pour démarrer…")
-        while GameWindow.foreground_hwnd() in (0, start):
-            sleep(0.1)
-        window = GameWindow(GameWindow.foreground_hwnd())
-        log.info("Fenêtre du jeu : « %s ».", window.title)
+        window = wait_for_clicked_window()
+        log.info("Fenêtre du jeu : « %s » (type %s).",
+                 window.title, GameWindow.class_name(window.hwnd))
+
+    if window.title and cfg.window_title != window.title:
+        log.info("Titre mémorisé : le bot activera lui-même cette fenêtre aux prochains lancements.")
+        cfg.window_title = window.title
+        remember_regions(cfg)
     sleep(settle)
     return window
 
@@ -889,7 +965,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--gauge-region", type=int, nargs=4, metavar=("L", "T", "W", "H"))
     p.add_argument("--template", type=Path, help="image de la bannière")
     p.add_argument("--window", metavar="TITRE",
-                   help="partie du titre de la fenêtre du jeu (sinon : fenêtre cliquée au démarrage)")
+                   help="titre (ou partie du titre) de la fenêtre du jeu")
+    p.add_argument("--list-windows", action="store_true",
+                   help="affiche les titres des fenêtres ouvertes puis quitte")
     p.add_argument("--invert", action="store_true", help="inverse Q et D")
     p.add_argument("--input", choices=("auto", "scancode", "pyautogui"),
                    help="méthode d'envoi des touches (auto = scancode sous Windows)")
@@ -915,6 +993,8 @@ def build_config(args: argparse.Namespace) -> Config:
         cfg.invert_controls = True
     if args.input:
         cfg.input_backend = args.input
+    if args.window:
+        cfg.window_title = args.window
     return cfg
 
 
@@ -932,6 +1012,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pyautogui.PAUSE = 0         # les délais sont gérés explicitement
 
     try:
+        if args.list_windows:
+            for hwnd in GameWindow.list_windows():
+                print(f"  {GameWindow.window_title(hwnd)}")
+            return 0
         if args.setup:
             return setup(cfg, args.config)
         if args.calibrate:
@@ -947,7 +1031,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         log.info("Échap ou souris dans un coin de l'écran pour arrêter.")
         if sys.platform == "win32":
-            target = pick_target(args.window, cfg.startup_countdown)
+            target = pick_target(cfg, cfg.startup_countdown)
             warn_if_input_blocked(target)
         else:
             sleep(cfg.startup_countdown)
