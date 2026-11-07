@@ -35,6 +35,36 @@ Activé par défaut (`--robotic` pour le désactiver) :
 - **sessions** : 20 à 45 min de pêche, puis 5 à 15 min de pause (`--no-breaks` pour
   désactiver).
 
+## Réapprovisionnement en appâts
+
+Quand la bannière « Equip bait before fishing. » apparaît (`templates/no_bait.png`), le bot
+rachète des appâts tout seul, puis reprend la pêche :
+
+1. `Q`, puis clic sur **Quick Submit** ;
+2. clic sur l'**onglet au cube**, puis **Quick Sell** (vend les prises) ;
+3. `Échap`, puis `R` pour ouvrir la boutique ;
+4. clic sur **Universal Bait** (celui à 5 coquillages), sur le **double chevron** (quantité
+   maximale), puis sur **Purchase** ;
+5. `Échap`.
+
+Les boutons sont dans `templates/restock/`. Ils sont recadrés à l'intérieur du contour rose
+de survol, donc ils sont reconnus que la souris soit dessus ou non. L'icône du cube est
+comparée par ses contours : l'onglet est reconnu qu'il soit gris ou orange. Les captures
+d'origine sont conservées dans `templates/originals/`.
+
+Le tout se fait comme un humain :
+
+- la souris suit une trajectoire courbe, accélère puis ralentit en approchant du bouton ;
+- la durée du geste dépend de la distance et de la taille du bouton (loi de Fitts) ;
+- le curseur dépasse parfois légèrement la cible et se corrige, et il tremble très légèrement ;
+- le point cliqué varie autour du centre du bouton, avec un court survol avant le clic ;
+- le bot prend un temps de réaction quand un bouton apparaît, et hésite de temps en temps.
+
+Le bot attend que chaque bouton soit affiché et immobile, à la fin de l'animation, avant de
+cliquer. Si un bouton n'apparaît pas, il ferme les menus avec `Échap` et s'arrête avec une
+alerte. Il ne refait jamais deux réapprovisionnements d'affilée : si la bannière revient
+juste après un achat (plus de coquillages ?), il s'arrête au lieu de boucler.
+
 ## Contrôle, sécurité et statistiques
 
 - **F8** : pause et reprise. Les touches sont relâchées pendant la pause, et un nouveau cycle

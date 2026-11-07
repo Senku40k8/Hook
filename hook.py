@@ -11,6 +11,10 @@ Cycle exécuté en boucle :
     4. Jauge disparue : résultat (réussite/échec) lu si possible, appui sur F.
     5. Pause (au moins 3 s, parfois plus longue) puis retour à l'étape 1.
 
+Plus d'appâts (bannière « Equip bait before fishing ») : rachat automatique via
+les menus du jeu (Q, Quick Submit, cube, Quick Sell, Échap, R, Universal Bait,
+quantité max., Purchase, Échap), avec des gestes de souris naturels.
+
 Comportement humain (module session.py) : temps de réaction réalistes, fatigue,
 petites imperfections, sessions de 20-45 min entrecoupées de pauses de 5-15 min.
 
@@ -147,6 +151,21 @@ class Config:
     result_timeout: float = 1.5             # attente max. du message de résultat (s)
     max_consecutive_failures: int = 3       # arrêt après N cycles ratés de suite
 
+    # --- Réapprovisionnement en appâts --------------------------------------
+    # Déclenché par la bannière « Equip bait before fishing » (templates/no_bait.png).
+    # Étapes : Q, Quick Submit, onglet cube, Quick Sell, Échap, R, Universal Bait
+    # (5 coquillages), quantité max., Purchase, Échap.
+    restock_enabled: bool = True
+    restock_dir: Path = TEMPLATES_DIR / "restock"
+    no_bait_template: Path = TEMPLATES_DIR / "no_bait.png"
+    restock_threshold: float = 0.80         # boutons texte (niveaux de gris)
+    restock_icon_threshold: float = 0.60    # icônes (contours)
+    restock_step_timeout: float = 6.0       # attente max. de chaque bouton (s)
+    restock_step_delay: Range = (0.35, 0.8) # pause humaine entre deux étapes
+    # Sans templates/no_bait.png : tenter un réapprovisionnement quand la bannière
+    # « Fish on the hook » n'arrive pas (une seule fois avant de compter un échec).
+    restock_on_no_banner: bool = True
+
     # --- Session, comportement humain, statistiques -------------------------
     human: HumanConfig = field(default_factory=HumanConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
@@ -206,7 +225,12 @@ def _key_is_down(vk: int) -> bool:
     return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+_ignore_escape_until = 0.0         # Échap envoyé par le bot lui-même (menus)
+
+
 def _escape_pressed() -> bool:
+    if time.perf_counter() < _ignore_escape_until:
+        return False
     return _key_is_down(_VK_ESCAPE)
 
 
@@ -349,7 +373,11 @@ class ScancodeKeyboard:
         self._u32 = u32
         self._codes: dict[str, int] = {}
 
+    SPECIAL_SCANCODES = {"esc": 0x01, "escape": 0x01, "enter": 0x1C, "space": 0x39}
+
     def scancode(self, key: str) -> int:
+        if key in self.SPECIAL_SCANCODES:
+            return self.SPECIAL_SCANCODES[key]
         if key not in self._codes:
             if len(key) != 1:
                 raise ValueError(f"Touche non gérée en mode scancode : {key!r}")
@@ -404,8 +432,12 @@ def tap(key: str, duration: Range) -> None:
     """Pression courte d'une touche, durée de maintien tirée dans duration.
 
     N'envoie rien tant que la fenêtre du jeu n'est pas au premier plan."""
+    global _ignore_escape_until
     wait_for_focus()
     hold = human.within(duration)
+    if key in ("esc", "escape"):
+        # Notre propre Échap ne doit pas être pris pour une demande d'arrêt.
+        _ignore_escape_until = time.perf_counter() + hold + 0.4
     keyboard.down(key)
     _held_keys.add(key)
     try:
@@ -644,6 +676,32 @@ def _sct():
     return _screen
 
 
+def move_mouse(tx: float, ty: float, target_size: float) -> None:
+    """Déplace la souris le long d'un trajet humain (courbe, vitesse en cloche)."""
+    start = pyautogui.position()
+    for x, y, delay in human.mouse_path((start[0], start[1]), (tx, ty), target_size):
+        if delay > 0:
+            sleep(delay)
+        pyautogui.moveTo(int(round(x)), int(round(y)), _pause=False)
+
+
+def click_box(box: Region) -> None:
+    """Clic souris « humain » dans un rectangle (coordonnées écran) : point
+    visé autour du centre (loi normale), trajet naturel, court survol, appui
+    de durée variable."""
+    x, y, w, h = box
+    ox = max(-0.35, min(0.35, human.rng.gauss(0, 0.12))) * w
+    oy = max(-0.30, min(0.30, human.rng.gauss(0, 0.12))) * h
+    wait_for_focus()
+    move_mouse(x + w / 2 + ox, y + h / 2 + oy, min(w, h))
+    sleep(human.within((0.06, 0.22)))           # survol avant de cliquer
+    pyautogui.mouseDown(_pause=False)
+    try:
+        sleep(human.within((0.05, 0.12)))
+    finally:
+        pyautogui.mouseUp(_pause=False)
+
+
 def full_screen_region() -> Region:
     """Zone couvrant l'écran principal."""
     mon = _sct().monitors[1]
@@ -683,26 +741,42 @@ def remember_regions(cfg: Config) -> None:
 # --------------------------------------------------------------------------- #
 # Détection de la bannière
 # --------------------------------------------------------------------------- #
-class BannerDetector:
-    """Repère la bannière par template matching multi-échelle en niveaux de gris."""
+def edge_map(gray: np.ndarray) -> np.ndarray:
+    """Contours épaissis : compare des formes indépendamment de leurs couleurs
+    (ex. icône sur un onglet gris ou orange selon qu'il est sélectionné)."""
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 40, 120)
+    return cv2.dilate(edges, np.ones((3, 3), np.uint8))
 
-    def __init__(self, template_path: Path, threshold: float, scales: Sequence[float]):
+
+class BannerDetector:
+    """Repère une image (bannière, bouton…) par template matching multi-échelle.
+
+    edges=False : comparaison en niveaux de gris (texte, boutons).
+    edges=True  : comparaison des contours (icônes dont la couleur change).
+    """
+
+    def __init__(self, template_path: Path, threshold: float, scales: Sequence[float],
+                 edges: bool = False):
         template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
         if template is None:
             raise FileNotFoundError(
                 f"Template introuvable : {template_path}\n"
-                "Faites une capture du texte de la bannière (voir README)."
+                "Faites une capture recadrée de l'élément (voir README)."
             )
         self.threshold = threshold
-        self.templates = [
+        self.edges = edges
+        scaled = [
             cv2.resize(template, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
             if s != 1.0 else template
             for s in scales
         ]
+        self.templates = [edge_map(t) if edges else t for t in scaled]
 
     def locate(self, frame_bgr: np.ndarray) -> Tuple[float, Optional[Region]]:
         """Meilleur score (0..1) et rectangle (x, y, w, h) correspondant dans l'image."""
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        if self.edges:
+            gray = edge_map(gray)
         best, box = 0.0, None
         for tpl in self.templates:
             if tpl.shape[0] > gray.shape[0] or tpl.shape[1] > gray.shape[1]:
@@ -1011,9 +1085,12 @@ def annotate(frame: np.ndarray, state: Optional[GaugeState],
     return out
 
 
-def wait_for_banner(cfg: Config, detector: BannerDetector) -> bool:
+def wait_for_banner(cfg: Config, detector: BannerDetector,
+                    no_bait: Optional[BannerDetector] = None) -> Optional[str]:
+    """'banner' (poisson ferré), 'no_bait' (plus d'appâts) ou None (délai dépassé)."""
     log.info("Attente de la bannière…")
     deadline = time.perf_counter() + cfg.banner_timeout
+    scans = 0
     while time.perf_counter() < deadline:
         check_stop()
         wait_for_focus()
@@ -1025,9 +1102,14 @@ def wait_for_banner(cfg: Config, detector: BannerDetector) -> bool:
                 cfg.banner_region = banner_lock_region(box, region)
                 remember_regions(cfg)
                 log.info("Zone de la bannière mémorisée : %s", cfg.banner_region)
-            return True
+            return "banner"
+        # « Equip bait before fishing » : vérifié sur toute la fenêtre, 1 fois sur 5.
+        if no_bait is not None and scans % 5 == 0 and no_bait.detect(grab(search_region())):
+            log.warning("Bannière « Equip bait before fishing » : plus d'appâts.")
+            return "no_bait"
+        scans += 1
         sleep(cfg.scan_interval)
-    return False
+    return None
 
 
 def wait_for_gauge(cfg: Config, detector: GaugeDetector) -> bool:
@@ -1140,10 +1222,109 @@ def wait_for_result(cfg: Config, results: MessageDetector) -> str:
     return "unknown"
 
 
+# --------------------------------------------------------------------------- #
+# Réapprovisionnement en appâts
+# --------------------------------------------------------------------------- #
+# (action, valeur) : "key" = touche à presser, "click" = bouton (templates/restock/<nom>.png)
+RESTOCK_STEPS: Tuple[Tuple[str, str], ...] = (
+    ("key", "q"),                   # menu
+    ("click", "quick_submit"),
+    ("click", "cube_tab"),          # onglet au cube
+    ("click", "quick_sell"),        # vend les prises : libère l'inventaire, rapporte des coquillages
+    ("key", "esc"),
+    ("key", "r"),                   # boutique
+    ("click", "universal_bait"),    # Universal Bait à 5 coquillages
+    ("click", "max_quantity"),      # double chevron : quantité maximale
+    ("click", "purchase"),
+    ("key", "esc"),
+)
+ICON_TEMPLATES = {"cube_tab"}   # comparé par contours : onglet gris ou orange selon la sélection
+
+
+class RestockFailed(Exception):
+    """Un bouton du réapprovisionnement n'est pas apparu à temps."""
+
+
+class Restocker:
+    """Rachète des appâts en suivant RESTOCK_STEPS, en vérifiant chaque bouton."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.buttons: Dict[str, BannerDetector] = {}
+        for action, name in RESTOCK_STEPS:
+            if action == "click":
+                icon = name in ICON_TEMPLATES
+                self.buttons[name] = BannerDetector(
+                    cfg.restock_dir / f"{name}.png",
+                    cfg.restock_icon_threshold if icon else cfg.restock_threshold,
+                    cfg.banner_scales, edges=icon)
+
+    def wait_for_button(self, name: str) -> Region:
+        """Attend que le bouton soit visible et immobile (fin d'animation) ;
+        renvoie son rectangle en coordonnées écran."""
+        detector = self.buttons[name]
+        deadline = time.perf_counter() + self.cfg.restock_step_timeout
+        previous: Optional[Region] = None
+        while time.perf_counter() < deadline:
+            check_stop()
+            wait_for_focus()
+            region = search_region()
+            score, box = detector.locate(grab(region))
+            if score >= detector.threshold and box is not None:
+                screen_box = (region[0] + box[0], region[1] + box[1], box[2], box[3])
+                if previous is not None and abs(previous[0] - screen_box[0]) <= 3 \
+                        and abs(previous[1] - screen_box[1]) <= 3:
+                    return screen_box
+                previous = screen_box
+            else:
+                previous = None
+            sleep(0.08)
+        raise RestockFailed(f"bouton « {name} » introuvable")
+
+    def run(self) -> None:
+        log.info("Réapprovisionnement en appâts…")
+        try:
+            for action, value in RESTOCK_STEPS:
+                # Rythme humain : courte pause, parfois une hésitation.
+                sleep(human.within(self.cfg.restock_step_delay) + human.hesitation())
+                if action == "key":
+                    log.info("  touche %s", value.upper())
+                    tap(value, self.cfg.action_press_duration)
+                else:
+                    box = self.wait_for_button(value)
+                    sleep(human.reaction())     # temps de repérer le bouton apparu
+                    log.info("  clic sur %s", value)
+                    click_box(box)
+        except RestockFailed:
+            # Referme les menus restés ouverts avant d'abandonner.
+            for _ in range(2):
+                sleep(human.within((0.3, 0.6)))
+                tap("esc", self.cfg.action_press_duration)
+            raise
+        sleep(human.within((0.8, 1.5)))
+        log.info("Appâts rachetés, reprise de la pêche.")
+
+
+def restock_or_stop(cfg: Config, restocker: Optional[Restocker]) -> None:
+    if restocker is None:
+        raise BlockedStop("plus d'appâts : réapprovisionnement désactivé, ou déjà tenté "
+                          "juste avant sans effet (plus de coquillages ?)")
+    try:
+        restocker.run()
+    except RestockFailed as exc:
+        raise BlockedStop(f"réapprovisionnement impossible ({exc})") from None
+
+
 def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number: int,
               results: Optional[MessageDetector] = None,
-              stoppers: Optional[MessageDetector] = None) -> CycleRecord:
-    """Un cycle complet ; renvoie son résultat pour les statistiques."""
+              stoppers: Optional[MessageDetector] = None,
+              no_bait: Optional[BannerDetector] = None,
+              restocker: Optional[Restocker] = None,
+              may_restock_blind: bool = False) -> CycleRecord:
+    """Un cycle complet ; renvoie son résultat pour les statistiques.
+
+    may_restock_blind : sans template no_bait, tenter un réapprovisionnement si
+    la bannière n'arrive pas (le cycle précédent n'en a pas déjà tenté un)."""
     results = results or MessageDetector([], cfg.message_threshold, cfg.banner_scales)
     stoppers = stoppers or MessageDetector([], cfg.message_threshold, cfg.banner_scales)
     check_blockers(cfg, stoppers)
@@ -1155,9 +1336,17 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number:
 
     # Étape 2 : bannière -> second appui après un temps de réaction humain
     waited = time.perf_counter()
-    if not wait_for_banner(cfg, banner):
+    seen = wait_for_banner(cfg, banner, no_bait)
+    if seen == "no_bait":
+        restock_or_stop(cfg, restocker)
+        return CycleRecord(number, "restock")
+    if seen is None:
         log.warning("Bannière non détectée après %.0f s, cycle abandonné.", cfg.banner_timeout)
         check_blockers(cfg, stoppers)
+        if may_restock_blind and restocker is not None:
+            log.info("Peut-être plus d'appâts : tentative de réapprovisionnement.")
+            restock_or_stop(cfg, restocker)
+            return CycleRecord(number, "restock")
         return CycleRecord(number, "no_banner")
     banner_wait = time.perf_counter() - waited
     sleep(human.reaction() if human.cfg.enabled else rand(cfg.reaction_delay))
@@ -1377,6 +1566,23 @@ def take_break(seconds: float) -> None:
     human.rest()
 
 
+def restock_tools(cfg: Config) -> Tuple[Optional[BannerDetector], Optional[Restocker]]:
+    """Détecteur « Equip bait before fishing » et réapprovisionneur, si disponibles."""
+    no_bait = None
+    if cfg.no_bait_template.exists():
+        no_bait = BannerDetector(cfg.no_bait_template, cfg.banner_threshold, cfg.banner_scales)
+    if not cfg.restock_enabled:
+        return no_bait, None
+    try:
+        restocker = Restocker(cfg)
+    except FileNotFoundError as exc:
+        log.warning("Réapprovisionnement indisponible : %s", exc)
+        return no_bait, None
+    log.info("Réapprovisionnement automatique en appâts : activé%s.",
+             "" if no_bait else " (sans templates/no_bait.png : tenté si la bannière n'arrive pas)")
+    return no_bait, restocker
+
+
 def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
              gauge: GaugeDetector, stats: Stats) -> None:
     """Boucle principale : cycles, pauses, sessions, plafonds et arrêts sur blocage."""
@@ -1386,6 +1592,7 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
         log.info("Messages de résultat reconnus : %s", ", ".join(results.names()))
     if stoppers:
         log.info("Messages bloquants surveillés : %s", ", ".join(stoppers.names()))
+    no_bait, restocker = restock_tools(cfg)
 
     cycle = 0
     while args.cycles == 0 or cycle < args.cycles:
@@ -1403,7 +1610,14 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
 
             cycle += 1
             log.info("===== Cycle %d =====", cycle)
-            record = run_cycle(cfg, banner, gauge, cycle, results, stoppers)
+            # Pas deux réapprovisionnements d'affilée : évite une boucle d'achats
+            # quand il n'y a plus de coquillages.
+            just_restocked = bool(stats.records) and stats.records[-1].outcome == "restock"
+            record = run_cycle(
+                cfg, banner, gauge, cycle, results, stoppers, no_bait,
+                restocker=None if just_restocked else restocker,
+                may_restock_blind=(no_bait is None and cfg.restock_on_no_banner
+                                   and not just_restocked))
             stats.add(record)
             log.info("%s", stats.line(record))
             if stats.consecutive_failures >= cfg.max_consecutive_failures:

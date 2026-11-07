@@ -52,6 +52,9 @@ class HumanConfig:
     long_pause: Range = (5.0, 10.0)
     very_long_pause_chance: float = 0.03
     very_long_pause: Range = (10.0, 20.0)
+    # Menus : hésitation occasionnelle avant une action.
+    hesitation_chance: float = 0.12
+    hesitation: Range = (0.6, 1.8)
 
 
 class Humanizer:
@@ -118,6 +121,18 @@ class Humanizer:
             return self.rng.uniform(*self.cfg.late_correction_delay)
         return None
 
+    def hesitation(self) -> float:
+        """Petite hésitation occasionnelle avant une action dans un menu (s)."""
+        if self.cfg.enabled and self.rng.random() < self.cfg.hesitation_chance:
+            return self.rng.uniform(*self.cfg.hesitation)
+        return 0.0
+
+    def mouse_path(self, start: Tuple[float, float], end: Tuple[float, float],
+                   target_size: float = 40.0) -> List[Tuple[float, float, float]]:
+        """Trajet de souris : liste de (x, y, délai avant ce point en s)."""
+        return mouse_path(start, end, self.rng, target_size,
+                          natural=self.cfg.enabled, slowdown=self.fatigue())
+
     def press_factor(self) -> float:
         """Multiplicateur de durée d'appui : léger bruit, parfois un dépassement."""
         if not self.cfg.enabled:
@@ -125,6 +140,68 @@ class Humanizer:
         if self.rng.random() < self.cfg.overshoot_chance:
             return self.rng.uniform(*self.cfg.overshoot_factor)
         return self.rng.uniform(0.85, 1.15)
+
+
+# --------------------------------------------------------------------------- #
+# Mouvements de souris
+# --------------------------------------------------------------------------- #
+def _min_jerk(t: float) -> float:
+    """Profil de vitesse d'un geste humain : accélère, puis freine en approche."""
+    return 10 * t ** 3 - 15 * t ** 4 + 6 * t ** 5
+
+
+def _segment(start, end, rng: random.Random, duration: float, curve: float,
+             jitter: float) -> List[Tuple[float, float, float]]:
+    """Courbe de Bézier cubique de start à end, parcourue en `duration` secondes."""
+    (x0, y0), (x3, y3) = start, end
+    dx, dy = x3 - x0, y3 - y0
+    dist = math.hypot(dx, dy) or 1.0
+    nx, ny = -dy / dist, dx / dist                    # perpendiculaire au trajet
+    bend1 = rng.gauss(0, curve) * dist
+    bend2 = rng.gauss(0, curve) * dist
+    x1, y1 = x0 + dx * 0.3 + nx * bend1, y0 + dy * 0.3 + ny * bend1
+    x2, y2 = x0 + dx * 0.7 + nx * bend2, y0 + dy * 0.7 + ny * bend2
+    steps = max(4, int(duration / 0.008))             # ~125 positions par seconde
+    points = []
+    for i in range(1, steps + 1):
+        t = _min_jerk(i / steps)
+        u = 1 - t
+        x = u ** 3 * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t ** 3 * x3
+        y = u ** 3 * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t ** 3 * y3
+        if i < steps:                                 # léger tremblement, sauf à l'arrivée
+            x += rng.gauss(0, jitter)
+            y += rng.gauss(0, jitter)
+        points.append((x, y, duration / steps))
+    return points
+
+
+def mouse_path(start: Tuple[float, float], end: Tuple[float, float],
+               rng: Optional[random.Random] = None, target_size: float = 40.0,
+               natural: bool = True, slowdown: float = 1.0) -> List[Tuple[float, float, float]]:
+    """Trajet de souris de start à end : liste de (x, y, délai avant ce point).
+
+    Mode naturel :
+    - durée selon la loi de Fitts (plus loin ou plus petit = plus long) ;
+    - trajectoire courbe, vitesse en cloche, léger tremblement ;
+    - sur les longs trajets, dépasse parfois un peu la cible puis corrige.
+    """
+    rng = rng or random.Random()
+    dist = math.hypot(end[0] - start[0], end[1] - start[1])
+    if dist < 1:
+        return [(end[0], end[1], 0.0)]
+    if not natural:
+        return _segment(start, end, rng, 0.15, curve=0.0, jitter=0.0)
+
+    fitts = 0.10 + 0.10 * math.log2(dist / max(target_size, 8.0) + 1)
+    duration = fitts * rng.uniform(0.85, 1.25) * slowdown
+    if dist > 250 and rng.random() < 0.2:
+        # Dépassement de 3 à 8 % puis petite correction.
+        over = rng.uniform(0.03, 0.08)
+        mid = (end[0] + (end[0] - start[0]) * over + rng.gauss(0, 4),
+               end[1] + (end[1] - start[1]) * over + rng.gauss(0, 4))
+        return (_segment(start, mid, rng, duration, curve=0.08, jitter=0.6)
+                + _segment(mid, end, rng, rng.uniform(0.08, 0.16), curve=0.02, jitter=0.3))
+    return _segment(start, end, rng, duration, curve=0.08, jitter=0.6)
 
 
 # --------------------------------------------------------------------------- #
@@ -213,6 +290,7 @@ OUTCOME_LABELS = {
     "no_banner": "pas de bannière",
     "no_gauge": "pas de jauge",
     "timeout": "jauge trop longue",
+    "restock": "réapprovisionnement en appâts",
 }
 CATCH_OUTCOMES = {"success", "unknown"}             # comptés comme poissons
 FAILURE_OUTCOMES = {"fail", "no_banner", "no_gauge", "timeout"}

@@ -311,5 +311,171 @@ class FullCycleTest(unittest.TestCase):
         self.assertEqual(self.game.keys, [])                # aucune touche envoyée
 
 
+# --------------------------------------------------------------------------- #
+# Souris
+# --------------------------------------------------------------------------- #
+class MousePathTest(unittest.TestCase):
+    def test_path_ends_exactly_on_target_and_is_curved(self):
+        rng = random.Random(3)
+        curved = 0
+        for _ in range(50):
+            path = Humanizer(HumanConfig(), rng).mouse_path((100, 100), (900, 500), 40)
+            x, y, _ = path[-1]
+            self.assertAlmostEqual(x, 900, delta=0.01)
+            self.assertAlmostEqual(y, 500, delta=0.01)
+            # écart max. à la ligne droite
+            dev = max(abs((px - 100) * 400 - (py - 100) * 800) / 894.4 for px, py, _ in path)
+            curved += dev > 5
+        self.assertGreater(curved, 25)
+
+    def test_duration_follows_fitts_law(self):
+        rng = random.Random(5)
+        h = Humanizer(HumanConfig(), rng)
+
+        def avg(dist, size):
+            return sum(sum(d for _, _, d in h.mouse_path((0, 0), (dist, 0), size))
+                       for _ in range(200)) / 200
+        self.assertLess(avg(100, 60), avg(1200, 60))     # plus loin = plus long
+        self.assertLess(avg(600, 120), avg(600, 15))     # plus petit = plus long
+        self.assertTrue(0.15 < avg(600, 60) < 1.0)
+
+    def test_speed_profile_slows_down_near_target(self):
+        path = Humanizer(HumanConfig(), random.Random(9)).mouse_path((0, 0), (800, 0), 40)
+        xs = [p[0] for p in path]
+        steps = [abs(b - a) for a, b in zip(xs, xs[1:])]
+        third = len(steps) // 3
+        self.assertGreater(sum(steps[third:2 * third]), sum(steps[-third:]))
+
+
+# --------------------------------------------------------------------------- #
+# Réapprovisionnement contre un faux jeu
+# --------------------------------------------------------------------------- #
+RESTOCK_DIR = Path(__file__).resolve().parents[1] / "templates" / "restock"
+NO_BAIT = Path(__file__).resolve().parents[1] / "templates" / "no_bait.png"
+
+
+def greyed(img):
+    """Icône sur onglet gris (non sélectionné) au lieu d'orange."""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g = (g - g.min()) / max(1.0, g.max() - g.min()) * 70 + 40
+    return cv2.cvtColor(g.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+
+class FakeShop:
+    """Menus du jeu : chaque écran montre un bouton ; un clic dessus (et
+    seulement dessus) ou la bonne touche fait passer à l'écran suivant."""
+
+    SCREENS = ["no_bait", "menu", "quick_submit", "cube_tab", "quick_sell", "sold",
+               "shop", "universal_bait", "max_quantity", "purchase", "bought", "fishing"]
+    KEYS = {"no_bait": "q", "sold": "esc", "shop_closed": "r", "bought": "esc"}
+
+    def __init__(self):
+        self.screen = "idle"
+        self.keys, self.clicks = [], []
+        self.button_box = None
+        self.images = {p.stem: cv2.imread(str(p)) for p in RESTOCK_DIR.glob("*.png")}
+        self.images["cube_tab"] = greyed(self.images["cube_tab"])
+        self.no_bait = cv2.imread(str(NO_BAIT))
+
+    # --- clavier ---
+    name = "fake"
+
+    def prepare(self, keys):
+        pass
+
+    def down(self, key):
+        self.keys.append(key)
+        transitions = {("idle", "f"): "no_bait", ("no_bait", "q"): "quick_submit",
+                       ("sold", "esc"): "closed", ("closed", "r"): "universal_bait",
+                       ("bought", "esc"): "fishing"}
+        self.screen = transitions.get((self.screen, key), self.screen)
+
+    def up(self, key):
+        pass
+
+    # --- souris ---
+    def click(self, box):
+        cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+        bx, by, bw, bh = self.button_box
+        self.clicks.append(self.screen)
+        if not (bx <= cx <= bx + bw and by <= cy <= by + bh):
+            return  # clic à côté : rien ne se passe
+        nxt = {"quick_submit": "cube_tab", "cube_tab": "quick_sell", "quick_sell": "sold",
+               "universal_bait": "max_quantity", "max_quantity": "purchase",
+               "purchase": "bought"}
+        self.screen = nxt[self.screen]
+
+    # --- écran ---
+    def grab(self, region=None):
+        canvas = np.full((700, 1000, 3), 35, np.uint8)
+        if self.screen == "no_bait":
+            h, w = self.no_bait.shape[:2]
+            canvas[300:300 + h, 200:200 + w] = self.no_bait
+        elif self.screen in self.images:
+            img = self.images[self.screen]
+            h, w = img.shape[:2]
+            x, y = 300 + 7 * len(self.clicks), 250 + 11 * len(self.clicks)
+            canvas[y:y + h, x:x + w] = img
+            self.button_box = (x, y, w, h)
+        return canvas
+
+
+@unittest.skipUnless(RESTOCK_DIR.is_dir() and NO_BAIT.exists(), "templates absents")
+class RestockTest(unittest.TestCase):
+    def setUp(self):
+        self.shop = FakeShop()
+        self.saved = (hook.grab, hook.keyboard, hook.human, hook.target, hook.click_box)
+        hook.grab = self.shop.grab
+        hook.keyboard = self.shop
+        hook.click_box = self.shop.click
+        hook.human = Humanizer(HumanConfig(enabled=False, reaction_median=0.0))
+        hook.target = None
+        cfg = hook.Config(config_path=None)
+        cfg.restock_step_delay = (0.0, 0.0)
+        cfg.action_press_duration = (0.001, 0.001)
+        cfg.start_delay = (0.0, 0.0)
+        cfg.banner_timeout = 2.0
+        cfg.scan_interval = 0.0
+        cfg.restock_step_timeout = 2.0
+        cfg.banner_region = (0, 0, 1000, 700)
+        self.cfg = cfg
+
+    def tearDown(self):
+        (hook.grab, hook.keyboard, hook.human, hook.target, hook.click_box) = self.saved
+
+    def cycle(self, restocker):
+        cfg = self.cfg
+        no_bait, _ = hook.restock_tools(cfg)
+        banner = hook.BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)
+        return hook.run_cycle(cfg, banner, hook.GaugeDetector(cfg), 1, None, None,
+                              no_bait, restocker)
+
+    def test_full_restock_sequence(self):
+        record = self.cycle(hook.Restocker(self.cfg))
+        self.assertEqual(record.outcome, "restock")
+        self.assertEqual(self.shop.screen, "fishing")       # tout le parcours effectué
+        self.assertEqual(self.shop.keys, ["f", "q", "esc", "r", "esc"])
+        self.assertEqual(self.shop.clicks, ["quick_submit", "cube_tab", "quick_sell",
+                                            "universal_bait", "max_quantity", "purchase"])
+
+    def test_own_escape_is_not_a_stop_request(self):
+        hook._ignore_escape_until = 0.0
+        hook.tap("esc", (0.001, 0.001))
+        self.assertGreater(hook._ignore_escape_until, hook.time.perf_counter())
+        self.assertFalse(hook._escape_pressed())
+
+    def test_missing_button_aborts_and_closes_menus(self):
+        self.shop.images.pop("purchase")                    # bouton jamais affiché
+        self.cfg.restock_step_timeout = 0.3
+        with self.assertRaises(hook.BlockedStop):
+            self.cycle(hook.Restocker(self.cfg))
+        self.assertEqual(self.shop.keys[-2:], ["esc", "esc"])
+
+    def test_no_second_restock_in_a_row(self):
+        with self.assertRaises(hook.BlockedStop) as ctx:
+            self.cycle(None)                                # déjà tenté au cycle précédent
+        self.assertIn("coquillages", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
