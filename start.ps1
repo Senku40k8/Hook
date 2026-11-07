@@ -95,7 +95,10 @@ if (-not (Test-Path $venvPython)) {
 
 # --- 4. Dependances ------------------------------------------------------------
 $stamp = Join-Path $PSScriptRoot '.venv\requirements.sha256'
-$hash = (Get-FileHash (Join-Path $PSScriptRoot 'requirements.txt') -Algorithm SHA256).Hash
+# Empreinte via .NET (Get-FileHash peut manquer quand PowerShell 5.1 est lance depuis pwsh 7).
+$sha = [Security.Cryptography.SHA256]::Create()
+$bytes = [IO.File]::ReadAllBytes((Join-Path $PSScriptRoot 'requirements.txt'))
+$hash = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '')
 $installed = (Test-Path $stamp) -and ((Get-Content $stamp -Raw).Trim() -eq $hash)
 if ($installed) {
     & $venvPython -c "import cv2, mss, numpy, pyautogui" 2>$null
