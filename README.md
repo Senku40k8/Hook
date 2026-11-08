@@ -13,13 +13,19 @@ les droits (fenêtre de confirmation de Windows), car le jeu tourne en administr
 premier lancement, il prépare tout seul Python et les dépendances. Un double-clic sur
 `start.bat` fonctionne aussi.
 
-**Sur un autre ordinateur :**
+**Sur un autre ordinateur**, dans un PowerShell **normal** (pas administrateur : un
+PowerShell administrateur démarre dans `C:\Windows\System32`, et le projet serait cloné
+là) :
 
 ```powershell
+cd $HOME\Documents
 git clone https://github.com/Senku40k8/Hook.git
 cd Hook
 .\start.bat
 ```
+
+Si `git` est introuvable, installez-le avec `winget install Git.Git`, puis rouvrez
+PowerShell. On peut aussi télécharger le ZIP depuis GitHub.
 
 Le script s'occupe du reste :
 
@@ -28,14 +34,24 @@ Le script s'occupe du reste :
 - **mises à jour** : il réinstalle les dépendances quand `requirements.txt` change ;
 - **dossier copié** : il recrée `.venv` s'il est inutilisable, par exemple s'il vient d'un autre PC.
 
-Il faut seulement Windows 10 ou 11, une connexion Internet au premier lancement, et `git`
-pour cloner. On peut aussi télécharger le ZIP depuis GitHub.
+Il faut seulement Windows 10 ou 11 et une connexion Internet au premier lancement.
+
+**Dans le jeu**, placez-vous devant un point de pêche, avec l'invite « Fishing » visible :
+le bot appuie lui-même sur `F`. Au premier lancement sur un PC, **cliquez dans la fenêtre
+du jeu** quand le bot le demande. Son titre est mémorisé, et le bot la mettra ensuite
+lui-même au premier plan.
+
+> **Conditions pour un autre PC**
+>
+> - **Résolution 2560×1600.** Les images de référence (`templates/`) viennent d'un écran
+>   2560×1600. Le bot tolère environ ±10 % de taille. Dans une autre résolution, par
+>   exemple 1920×1080, les boutons ne seront pas reconnus.
+> - **Clavier AZERTY.** Le bot tire à gauche avec la touche Q d'un clavier AZERTY. Sur un
+>   clavier QWERTY, le jeu attend probablement A.
+> - **Jeu en anglais.** Le bot reconnaît les textes « Purchase », « Switch », « Confirm »…
 
 Les options du bot se placent après la commande, par exemple
 `.\start.bat -v --duration 2h`. Elles sont détaillées plus bas.
-
-Au premier lancement sur un PC, **cliquez dans la fenêtre du jeu** : son titre est mémorisé,
-et le bot la mettra ensuite lui-même au premier plan.
 
 ## Ce que fait le bot
 
