@@ -273,19 +273,60 @@ def _pause_loop() -> None:
         time.sleep(0.05)
         if _escape_pressed():
             raise StopRequested("Touche Échap pressée")
-        pyautogui.failSafeCheck()
+        failsafe_check()
         if _pause_toggled():
             break
     log.info("REPRISE.")
     raise ResumeRequested()
 
 
+FAILSAFE_HOLD = 0.4                 # s dans un coin avant l'arrêt
+_corner_since: Optional[float] = None
+
+
+def _visible_cursor_in_corner() -> bool:
+    """True si le curseur est visible et dans un coin de l'écran principal.
+
+    Un curseur caché (le jeu le masque en mode pêche, et peut le placer dans un
+    coin) ne compte pas : seul l'utilisateur déclenche l'arrêt d'urgence."""
+    if sys.platform == "win32":
+        from ctypes import wintypes as wt
+
+        class CURSORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wt.DWORD), ("flags", wt.DWORD),
+                        ("hCursor", wt.HANDLE), ("ptScreenPos", wt.POINT)]
+        info = CURSORINFO()
+        info.cbSize = ctypes.sizeof(CURSORINFO)
+        if not ctypes.windll.user32.GetCursorInfo(ctypes.byref(info)):
+            return False
+        if not info.flags & 0x1:                # CURSOR_SHOWING
+            return False
+        x, y = info.ptScreenPos.x, info.ptScreenPos.y
+        w = ctypes.windll.user32.GetSystemMetrics(0)
+        h = ctypes.windll.user32.GetSystemMetrics(1)
+    else:
+        x, y = pyautogui.position()
+        w, h = pyautogui.size()
+    return (x <= 0 or x >= w - 1) and (y <= 0 or y >= h - 1)
+
+
+def failsafe_check() -> None:
+    """Arrêt d'urgence : souris visible maintenue dans un coin de l'écran."""
+    global _corner_since
+    if not _visible_cursor_in_corner():
+        _corner_since = None
+        return
+    now = time.perf_counter()
+    _corner_since = _corner_since or now
+    if now - _corner_since >= FAILSAFE_HOLD:
+        raise StopRequested("souris maintenue dans un coin de l'écran")
+
+
 def check_stop() -> None:
     """Point de contrôle appelé dans toutes les boucles."""
     if _escape_pressed():
         raise StopRequested("Touche Échap pressée")
-    # Lève pyautogui.FailSafeException si la souris est dans un coin.
-    pyautogui.failSafeCheck()
+    failsafe_check()
     if _pause_toggled():
         _pause_loop()
 
@@ -2048,6 +2089,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Journal complet (y compris la raison de chaque arrêt) dans logs/hook.log.
+    try:
+        log_dir = Path(__file__).with_name("logs")
+        log_dir.mkdir(exist_ok=True)
+        file_handler = logging.FileHandler(log_dir / "hook.log", encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        logging.getLogger().addHandler(file_handler)
+        logging.getLogger().setLevel(logging.DEBUG)
+        for handler in logging.getLogger().handlers:
+            if handler is not file_handler:
+                handler.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+        log.info("===== Lancement (journal : %s) =====", log_dir / "hook.log")
+    except OSError:
+        pass
     try:
         cfg = build_config(args)
     except ValueError as exc:
@@ -2058,7 +2115,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _pause_toggled()            # ignore un appui sur F8 antérieur au lancement
     stats = Stats(cfg.stats_path)
 
-    pyautogui.FAILSAFE = True   # souris dans un coin = arrêt immédiat
+    # Arrêt d'urgence géré par failsafe_check() (curseur visible tenu 0,4 s dans
+    # un coin) : celui de PyAutoGUI s'arrêtait dès que le jeu plaçait son curseur
+    # caché dans un coin, par exemple en entrant en mode pêche.
+    pyautogui.FAILSAFE = False
     pyautogui.PAUSE = 0         # les délais sont gérés explicitement
 
     try:
@@ -2111,6 +2171,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log.info("Arrêt : Ctrl+C.")
     except (FileNotFoundError, ValueError, OSError) as exc:
         log.error("%s", exc)
+        return 1
+    except Exception:
+        log.exception("Erreur inattendue : arrêt du bot (détail ci-dessous et dans logs/hook.log).")
+        alert("error")
         return 1
     finally:
         # Sécurité : aucune touche ne doit rester enfoncée.

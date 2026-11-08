@@ -248,10 +248,16 @@ en AZERTY comme en QWERTY. Les options en ligne de commande (`--gauge-region`,
 ## Arrêt
 
 - touche **Échap** (vérifiée en continu, même pendant les pauses) ;
-- **fail-safe** PyAutoGUI : amener la souris dans un coin de l'écran ;
+- **souris dans un coin** de l'écran pendant 0,4 s. Seul un curseur visible compte : le jeu
+  masque son curseur en mode pêche, et peut le placer dans un coin sans que le bot
+  s'arrête ;
 - **Ctrl+C** dans le terminal.
 
 Les touches sont toujours relâchées à l'arrêt.
+
+**Journal :** tout ce que fait le bot, avec la raison de chaque arrêt et le détail de toute
+erreur, est enregistré dans `logs\hook.log`. En cas de problème, envoyez ce fichier avec les
+captures de `debug\`.
 
 ## Tests
 
@@ -268,4 +274,15 @@ Ces tests ne nécessitent ni écran ni fenêtre cible. Ils vérifient :
 - un cycle complet contre un faux jeu, avec bannière, jauge pilotée par Q/D et message de
   réussite ;
 - l'achat et l'équipement d'appâts contre une fausse boutique : clics dans les bons boutons,
-  deux `Échap` après l'achat, et aucun achat quand un appât est équipé.
+  deux `Échap` après l'achat, et aucun achat quand un appât est équipé ;
+- **simulation de bout en bout** (`tests/test_simulation.py`) : la vraie boucle du bot contre
+  un faux NTE complet, sur plusieurs cycles, en 2560×1600 et en 1920×1080. Elle couvre six
+  cas de départ ou de déroulement :
+  - en mode pêche avec un appât ;
+  - lancement sur « Fishing Preparations » ;
+  - lancement devant l'invite « Fishing » ;
+  - appâts en stock mais non équipés ;
+  - plus d'appâts en cours de partie (vente, achat, équipement, puis reprise) ;
+  - plus d'appâts ni de coquillages.
+
+  Dans chaque cas, elle vérifie aussi que le bot ne sort jamais du mode pêche.
