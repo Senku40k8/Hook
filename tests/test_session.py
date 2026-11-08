@@ -618,6 +618,67 @@ class RealScreenshotTest(unittest.TestCase):
         self.assertLess(click_top + int(1.4 * h), y)   # au-dessus du texte
 
 
+@unittest.skipUnless(PREPARATIONS.exists(), "captures de référence absentes")
+class ResolutionTest(unittest.TestCase):
+    """Autres résolutions que 2560×1600 (cas du PC en 1920×1080, 08/11) : les
+    vraies captures sont réduites comme si le jeu tournait dans cette résolution."""
+
+    SHOTS = {"fishing preparations.jpg": {"bait_slot_empty", "start_fishing"},
+             "switch bait stock.jpg": {"switch", "cancel"},
+             "rewards.jpg": {"rewards_close"}}
+    # Réellement présent sur la capture, mais assombri derrière la fenêtre
+    # « Rewards » : le Purchase de la boutique (sans effet, le bot n'y cherche
+    # que « Press empty area to close »).
+    ALSO_VISIBLE = {"rewards.jpg": {"purchase"}}
+
+    def setUp(self):
+        self.saved = (hook.UI.candidates, hook.UI.locked, hook.UI.on_lock)
+
+    def tearDown(self):
+        hook.UI.candidates, hook.UI.locked, hook.UI.on_lock = self.saved
+
+    def test_candidates_cover_height_and_width_scaling(self):
+        hook.UI.configure(1920, 1080)
+        self.assertIn(round(1080 / 1600, 3), hook.UI.candidates)
+        self.assertIn(round(1920 / 2560, 3), hook.UI.candidates)
+        hook.UI.configure(2560, 1600)
+        self.assertEqual(hook.UI.scales((0.9, 1.0, 1.1)), (0.9, 1.0, 1.1))   # inchangé
+
+    def test_saved_scale_is_reused(self):
+        hook.UI.configure(1920, 1080, saved=0.7)
+        self.assertEqual(hook.UI.scales((1.0,))[1], 0.7)
+
+    def check_resolution(self, factor):
+        hook.UI.configure(1920, 1080)
+        locked = []
+        hook.UI.on_lock = locked.append
+        restocker = hook.Restocker(hook.Config())
+        for name, expected in self.SHOTS.items():
+            img = cv2.imread(str(ROOT / "templates" / "originals" / name))
+            small = cv2.resize(img, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
+            found = {n for n, det in restocker.buttons.items() if det.detect(small)}
+            found -= self.ALSO_VISIBLE.get(name, set())
+            self.assertEqual(found, expected, f"{name} à l'échelle {factor:.3f}")
+        self.assertTrue(locked, "échelle non déterminée")
+        self.assertAlmostEqual(locked[0], factor, delta=0.05)
+
+    def test_1080p_interface_scaled_by_height(self):
+        self.check_resolution(1080 / 1600)
+
+    def test_1080p_interface_scaled_by_width(self):
+        self.check_resolution(1920 / 2560)
+
+    def test_fish_banner_at_1080p(self):
+        hook.UI.configure(1920, 1080)
+        tpl = cv2.imread(str(ROOT / "templates" / "fish_on_hook.png"))
+        f = 1080 / 1600
+        small = cv2.resize(tpl, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+        screen = np.full((400, 1000, 3), 30, np.uint8)
+        screen[150:150 + small.shape[0], 200:200 + small.shape[1]] = small
+        det = hook.BannerDetector(ROOT / "templates" / "fish_on_hook.png", 0.8, (0.9, 1.0, 1.1))
+        self.assertTrue(det.detect(screen))
+
+
 @unittest.skipUnless(RESTOCK_DIR.is_dir() and EQUIP_BANNER.exists(), "templates absents")
 class RestockTest(unittest.TestCase):
     SELL = ["cancel", "quick_submit", "rewards_close", "cube_tab", "quick_sell", "confirm",
@@ -748,6 +809,16 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(self.shop.keys, ["f"])
         self.assertEqual(self.shop.clicks, ["start_fishing"])
         self.assertEqual(self.shop.screen, "fishing_mode")
+
+    def test_launched_on_preparations_panel_with_bait(self):
+        """Cas du PC en 1080p : bot lancé sur « Fishing Preparations » avec un appât
+        équipé -> « Start Fishing » est cliqué avant d'appuyer sur F."""
+        self.shop.screen = "prep_equipped"
+        _, restocker = hook.restock_tools(self.cfg)
+        self.assertTrue(restocker.start_fishing_if_shown())
+        self.assertEqual(self.shop.clicks, ["start_fishing"])
+        self.assertEqual(self.shop.screen, "fishing_mode")
+        self.assertFalse(restocker.start_fishing_if_shown())    # plus de panneau
 
     def test_no_fishing_prompt_no_key(self):
         self.shop.screen = "fishing_mode"

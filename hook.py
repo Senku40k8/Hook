@@ -92,6 +92,10 @@ class Config:
     # Titre de la fenêtre du jeu : mémorisé au premier lancement, le bot la met
     # ensuite lui-même au premier plan.
     window_title: Optional[str] = None
+    # Échelle de l'interface (autre résolution que 2560×1600), déterminée
+    # automatiquement et mémorisée pour la taille de fenêtre ui_scale_size.
+    ui_scale: Optional[float] = None
+    ui_scale_size: Optional[Tuple[int, int]] = None
     config_path: Optional[Path] = None      # où mémoriser les zones (non persisté)
     record_dir: Optional[Path] = None       # --record : images annotées du suivi
     record_max_frames: int = 600
@@ -186,6 +190,7 @@ PERSISTED_FIELDS = (
     "banner_region", "gauge_region",
     "green_lower", "green_upper", "yellow_lower", "yellow_upper",
     "invert_controls", "input_backend", "window_title", "line_speed",
+    "ui_scale", "ui_scale_size",
 )
 
 
@@ -758,6 +763,52 @@ def remember_regions(cfg: Config) -> None:
 # --------------------------------------------------------------------------- #
 # Détection de la bannière
 # --------------------------------------------------------------------------- #
+class UiScale:
+    """Échelle de l'interface du jeu par rapport aux images de référence.
+
+    Les images de templates/ viennent d'un écran 2560×1600. Sur une autre
+    résolution, l'interface est plus petite ou plus grande : on cherche d'abord
+    aux échelles plausibles (hauteur et largeur de la fenêtre, ±6 %), puis on
+    retient l'échelle exacte dès qu'une image est reconnue avec certitude.
+    """
+
+    REFERENCE = (2560, 1600)                # résolution des images de référence
+    LOCK_SCORE = 0.90                       # score minimal pour retenir une échelle
+
+    def __init__(self) -> None:
+        self.candidates: Tuple[float, ...] = ()
+        self.locked: Optional[float] = None
+        self.on_lock = None                 # rappel (échelle) pour la mémoriser
+
+    def configure(self, width: int, height: int, saved: Optional[float] = None) -> None:
+        rw, rh = width / self.REFERENCE[0], height / self.REFERENCE[1]
+        if abs(rw - 1) < 0.02 and abs(rh - 1) < 0.02 and saved is None:
+            self.candidates, self.locked = (), None     # même résolution : rien à faire
+            return
+        self.candidates = tuple(sorted({round(r * k, 3) for r in (rh, rw)
+                                        for k in (0.94, 1.0, 1.06)}))
+        self.locked = saved
+        log.info("Résolution %d×%d : échelle de l'interface %s.", width, height,
+                 f"{saved:.3f} (mémorisée)" if saved else
+                 "à déterminer parmi " + ", ".join(f"{c:.2f}" for c in self.candidates))
+
+    def scales(self, base: Sequence[float]) -> Tuple[float, ...]:
+        if self.locked is not None:
+            s = self.locked
+            return (round(s * 0.97, 3), s, round(s * 1.03, 3))
+        return self.candidates or tuple(base)
+
+    def confirm(self, scale: float, score: float) -> None:
+        if self.locked is None and self.candidates and score >= self.LOCK_SCORE:
+            self.locked = scale
+            log.info("Échelle de l'interface déterminée : %.3f.", scale)
+            if self.on_lock:
+                self.on_lock(scale)
+
+
+UI = UiScale()
+
+
 def edge_map(gray: np.ndarray) -> np.ndarray:
     """Contours épaissis : compare des formes indépendamment de leurs couleurs
     (ex. icône sur un onglet gris ou orange selon qu'il est sélectionné)."""
@@ -782,26 +833,43 @@ class BannerDetector:
             )
         self.threshold = threshold
         self.edges = edges
-        scaled = [
-            cv2.resize(template, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-            if s != 1.0 else template
-            for s in scales
-        ]
-        self.templates = [edge_map(t) if edges else t for t in scaled]
+        self.base = template
+        self.base_scales = tuple(scales)
+        self._cache: Dict[float, np.ndarray] = {}
+
+    def scaled_templates(self) -> List[Tuple[float, np.ndarray]]:
+        """(échelle, image) à essayer, selon l'échelle de l'interface (voir UiScale)."""
+        out = []
+        for s in UI.scales(self.base_scales):
+            tpl = self._cache.get(s)
+            if tpl is None:
+                tpl = self.base if s == 1.0 else cv2.resize(
+                    self.base, None, fx=s, fy=s,
+                    interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+                tpl = edge_map(tpl) if self.edges else tpl
+                self._cache[s] = tpl
+            out.append((s, tpl))
+        return out
+
+    @property
+    def templates(self) -> List[np.ndarray]:
+        return [tpl for _, tpl in self.scaled_templates()]
 
     def locate(self, frame_bgr: np.ndarray) -> Tuple[float, Optional[Region]]:
         """Meilleur score (0..1) et rectangle (x, y, w, h) correspondant dans l'image."""
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         if self.edges:
             gray = edge_map(gray)
-        best, box = 0.0, None
-        for tpl in self.templates:
+        best, box, best_scale = 0.0, None, 1.0
+        for scale, tpl in self.scaled_templates():
             if tpl.shape[0] > gray.shape[0] or tpl.shape[1] > gray.shape[1]:
                 continue
             result = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
             _, value, _, (x, y) = cv2.minMaxLoc(result)
             if value > best:
-                best, box = float(value), (x, y, tpl.shape[1], tpl.shape[0])
+                best, box, best_scale = float(value), (x, y, tpl.shape[1], tpl.shape[0]), scale
+        if box is not None and best >= self.threshold and not self.edges:
+            UI.confirm(best_scale, best)
         return best, box
 
     def score(self, frame_bgr: np.ndarray) -> float:
@@ -1391,6 +1459,19 @@ class Restocker:
             self._save_failure(name, frame, self.buttons[name])
         raise RestockFailed("ni « " + " » ni « ".join(names) + " » dans la fenêtre « Switch Bait »")
 
+    def start_fishing_if_shown(self) -> bool:
+        """Clique « Start Fishing » si le panneau de préparation est affiché."""
+        detector = self.buttons["start_fishing"]
+        region = search_region()
+        score, box = detector.locate(grab(region))
+        if box is None or score < detector.threshold:
+            return False
+        sleep(human.reaction())
+        log.info("Panneau « Fishing Preparations » : clic sur « Start Fishing ».")
+        click_box((region[0] + box[0], region[1] + box[1], box[2], box[3]))
+        sleep(human.within((1.0, 1.8)))
+        return True
+
     def bait_missing(self) -> bool:
         """True si la case d'appât vide (« Not Selected ») est visible."""
         return self.buttons["bait_slot_empty"].detect(grab(search_region()))
@@ -1632,6 +1713,10 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number:
         log.warning("Aucun appât équipé (case « Not Selected »).")
         restock_or_stop(cfg, restocker if may_restock else None)
         return CycleRecord(number, "restock")
+    # Panneau « Fishing Preparations » ouvert avec un appât équipé (lancement du
+    # bot sur ce panneau) : « Start Fishing » avant d'appuyer sur F.
+    if restocker is not None:
+        restocker.start_fishing_if_shown()
 
     # Étape 1 : lancement
     log.info("Étape 1 : appui sur %s", cfg.key_action.upper())
@@ -1861,6 +1946,23 @@ def build_config(args: argparse.Namespace) -> Config:
     return cfg
 
 
+def configure_ui_scale(cfg: Config) -> None:
+    """Adapte la reconnaissance d'images à la résolution de la fenêtre du jeu."""
+    width, height = search_region()[2:]
+    size = (int(width), int(height))
+    saved = cfg.ui_scale if cfg.ui_scale_size and tuple(cfg.ui_scale_size) == size else None
+    if cfg.ui_scale_size and tuple(cfg.ui_scale_size) != size and (cfg.banner_region or cfg.gauge_region):
+        # Autre résolution que la dernière fois : les zones mémorisées ne valent plus.
+        cfg.banner_region = cfg.gauge_region = None
+        log.info("Résolution changée : zones mémorisées oubliées.")
+    UI.configure(width, height, saved)
+
+    def remember(scale: float) -> None:
+        cfg.ui_scale, cfg.ui_scale_size = scale, size
+        remember_regions(cfg)
+    UI.on_lock = remember
+
+
 def take_break(seconds: float) -> None:
     """Pause longue entre deux sessions de jeu (interruptible : Échap, F8)."""
     resume_at = time.strftime("%H:%M", time.localtime(time.time() + seconds))
@@ -1986,6 +2088,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             warn_if_input_blocked(target)
         else:
             sleep(cfg.startup_countdown)
+        configure_ui_scale(cfg)
 
         if cfg.gauge_region is None or cfg.banner_region is None:
             log.info("Zones non mémorisées : recherche dans la fenêtre du jeu au premier "

@@ -43,9 +43,12 @@ lui-même au premier plan.
 
 > **Conditions pour un autre PC**
 >
-> - **Résolution 2560×1600.** Les images de référence (`templates/`) viennent d'un écran
->   2560×1600. Le bot tolère environ ±10 % de taille. Dans une autre résolution, par
->   exemple 1920×1080, les boutons ne seront pas reconnus.
+> - **Toutes les résolutions.** Les images de référence (`templates/`) viennent d'un écran
+>   2560×1600. Sur une autre résolution (1920×1080, 2560×1440, ultra-large, fenêtré…), le
+>   bot adapte leur taille à celle de la fenêtre du jeu. Il retient l'échelle exacte dès
+>   qu'il reconnaît un élément avec certitude, et la mémorise pour cette résolution.
+>   Au premier lancement dans une nouvelle résolution, les premières recherches sont un
+>   peu plus lentes.
 > - **Clavier AZERTY.** Le bot tire à gauche avec la touche Q d'un clavier AZERTY. Sur un
 >   clavier QWERTY, le jeu attend probablement A.
 > - **Jeu en anglais.** Le bot reconnaît les textes « Purchase », « Switch », « Confirm »…
