@@ -1395,6 +1395,8 @@ def wait_for_result(cfg: Config, results: MessageDetector) -> str:
 #   "bait_dialog" ouvre la fenêtre « Switch Bait » : clic sur la case d'appât si
 #                 le panneau « Fishing Preparations » est affiché, sinon touche E
 #   "optional"    bouton cliqué seulement s'il est affiché
+#   "confirm_rewards" après un achat : « Confirm » si le jeu le demande (pas pour
+#                 un petit achat, capture du 08/11 à 10:43), puis « Rewards »
 #   "dismiss"     fenêtre qui se ferme en cliquant dans une zone vide (Échap
 #                 ne la ferme pas) : repérée par son texte « Press empty area
 #                 to close », on clique juste au-dessus, hors de la fenêtre
@@ -1411,8 +1413,8 @@ BUY_STEPS: Tuple[Tuple[str, str], ...] = (
     ("click", "universal_bait"),         # Universal Bait à 5 coquillages
     ("click", "max_quantity"),           # double chevron : quantité maximale
     ("click", "purchase"),               # achat…
-    ("click", "confirm"),                # … à confirmer
-    ("dismiss", "rewards_close"),        # fenêtre « Rewards » : clic dans une zone vide
+    ("confirm_rewards", "confirm"),      # … « Confirm » éventuel (pas pour un petit achat),
+                                         #     puis « Rewards » fermée par un clic dans le vide
     ("key", "esc"),
     ("key", "esc"),
     ("bait_dialog", "bait_slot_empty"),  # de nouveau « Switch Bait »…
@@ -1500,7 +1502,7 @@ class Restocker:
             sleep(0.08)
         for name in names:
             self._save_failure(name, frame, self.buttons[name])
-        raise RestockFailed("ni « " + " » ni « ".join(names) + " » dans la fenêtre « Switch Bait »")
+        raise RestockFailed("ni « " + " » ni « ".join(names) + " » à l'écran")
 
     def start_fishing_if_shown(self) -> bool:
         """Clique « Start Fishing » si le panneau de préparation est affiché."""
@@ -1685,6 +1687,17 @@ class Restocker:
                 continue
             if action == "dismiss":
                 self.dismiss_popup(value)
+                continue
+            if action == "confirm_rewards":
+                # Le premier des deux qui s'affiche décide de la suite.
+                if self.wait_for_any((value, "rewards_close")) == value:
+                    box = self.wait_for_button(value, timeout=2.0)
+                    sleep(human.reaction())
+                    log.info("  clic sur %s", value)
+                    click_box(click_area(value, box))
+                else:
+                    log.info("  achat sans confirmation : fenêtre « Rewards » directement")
+                self.dismiss_popup("rewards_close")
                 continue
             before = clicked.get(value, [])
             if action == "optional":

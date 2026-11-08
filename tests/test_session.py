@@ -409,6 +409,7 @@ class FakeShop:
         self.origin = "fishing_mode"           # où ramène la fermeture de « Switch Bait »
         self.stock, self.shells, self.sell_gives = stock, shells, sell_gives
         self.equip_works = True
+        self.confirm_on_buy = True             # False : petit achat, « Rewards » direct
         self.ghost_purchase = False            # 1er Purchase visible derrière la boutique
         self.ghost_box = None
         self.keys, self.clicks, self.events = [], [], []
@@ -504,7 +505,11 @@ class FakeShop:
         elif hit == "purchase" and s == "shop_max":
             if self.shells >= 5:
                 self.shells -= 5
-                self.screen = "buy_confirm"
+                if self.confirm_on_buy:
+                    self.screen = "buy_confirm"
+                else:
+                    self.stock = 99
+                    self.screen = "buy_rewards"
         elif hit is not None:
             self.screen = {
                 "quick_submit": "submit_rewards", "cube_tab": "sell_tab",
@@ -618,6 +623,20 @@ class RealScreenshotTest(unittest.TestCase):
         hook.grab = lambda region=None: img
         try:
             self.assertEqual(restocker.wait_for_any(("switch", "purchase"), timeout=2.0), "switch")
+        finally:
+            hook.grab = saved
+
+    def test_small_purchase_goes_straight_to_rewards(self):
+        """Vraie capture du 08/11 à 10:43 : achat de 2 appâts, pas de « Confirm »,
+        « Rewards » directement. Le bot doit choisir Rewards (pas attendre Confirm)."""
+        img = cv2.imread(str(ROOT / "templates" / "originals" / "rewards small purchase.jpg"))
+        restocker = hook.Restocker(hook.Config())
+        self.assertFalse(restocker.buttons["confirm"].detect(img))
+        saved = hook.grab
+        hook.grab = lambda region=None: img
+        try:
+            self.assertEqual(restocker.wait_for_any(("confirm", "rewards_close"), timeout=2.0),
+                             "rewards_close")
         finally:
             hook.grab = saved
 
@@ -780,6 +799,19 @@ class RestockTest(unittest.TestCase):
         slot = ["bait_slot_empty"]
         self.assertEqual(self.shop.clicks, slot + self.BUY + slot + self.EQUIP)
         self.assertNotIn("q", self.shop.keys)
+        self.assertEqual(self.shop.screen, "equipped")
+
+    def test_small_purchase_without_confirm_then_equip(self):
+        """Cas du 08/11 à 10:43 : petit achat (2 appâts) -> pas de « Confirm »,
+        « Rewards » directement. Le bot ferme Rewards, Échap x2, puis équipe."""
+        self.shop.shells = 10
+        self.shop.confirm_on_buy = False
+        self.shop.screen = "slot_empty"
+        record = self.cycle()
+        self.assertEqual(record.outcome, "restock")
+        buy = [c for c in self.BUY if c != "confirm"]
+        slot = ["bait_slot_empty"]
+        self.assertEqual(self.shop.clicks, slot + buy + slot + self.EQUIP)
         self.assertEqual(self.shop.screen, "equipped")
 
     def test_no_bait_no_shells_on_panel_stops_with_clear_message(self):

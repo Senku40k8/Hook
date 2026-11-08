@@ -71,6 +71,7 @@ class FakeNTE:
         self.mode, self.equipped, self.stock = mode, equipped, stock
         self.shells, self.sell_gives = shells, sell_gives
         self.bite_after, self.gauge_frames = bite_after, gauge_frames
+        self.confirm_on_buy = True              # False : petit achat, « Rewards » direct
         self.origin = "fishing"
         self.menu_origin = "fishing"
         self.ticks = 0
@@ -229,7 +230,11 @@ class FakeNTE:
         elif hit == "purchase" and m == "shop_max":
             if self.shells >= 5:
                 self.shells -= 5
-                self.mode = "buy_confirm"
+                if self.confirm_on_buy:
+                    self.mode = "buy_confirm"
+                else:
+                    self.stock += 2
+                    self.mode = "buy_rewards"
         elif hit == "confirm":
             if m == "sell_confirm":
                 self.shells += self.sell_gives
@@ -369,6 +374,21 @@ class SimulationTest(unittest.TestCase):
             self.assertNotIn("clic cancel", game.events)
             self.assertNotIn("clic quick_submit", game.events)   # pas de vente depuis le panneau
             self.assertEqual(game.fish, 2, game.events)
+        self.for_each_resolution(scenario)
+
+    def test_small_purchase_without_confirm_then_select_and_fish(self):
+        """Cas du 08/11 à 10:43 : achat de 2 appâts sans « Confirm » (Rewards direct),
+        puis sélection de l'appât (Switch), Start Fishing et pêche."""
+        def scenario(w, h):
+            game = FakeNTE(w, h, mode="spot", equipped=False, stock=0, shells=10)
+            game.confirm_on_buy = False
+            stats, error = self.run_bot(game, cycles=3)
+            self.assertIsNone(error, game.events)
+            self.assertNotIn("clic confirm", game.events)
+            self.assertIn("clic switch", game.events)                 # appât sélectionné
+            self.assertEqual([r.outcome for r in stats.records], ["restock", "unknown", "unknown"])
+            self.assertEqual(game.fish, 2, game.events)
+            self.check_no_exit(game)
         self.for_each_resolution(scenario)
 
     def test_launched_at_spot_without_bait_nor_shells(self):

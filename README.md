@@ -133,9 +133,10 @@ Achat et équipement :
 
 1. clic sur **Purchase** ;
 2. clic sur **Universal Bait** (celui à 5 coquillages), sur le **double chevron** (quantité
-   maximale), sur **Purchase**, puis sur **Confirm** ;
-3. fermeture de la fenêtre **Rewards** par un clic dans une zone vide (elle ne se ferme pas
-   avec `Échap`) ;
+   maximale), puis sur **Purchase** ;
+3. clic sur **Confirm** si le jeu le demande (pas pour un petit achat), puis fermeture de
+   la fenêtre **Rewards** par un clic dans une zone vide (elle ne se ferme pas avec
+   `Échap`) ;
 4. `Échap` **deux fois** ;
 5. nouvelle ouverture de **Switch Bait**, puis clic sur **Switch** pour **équiper** l'appât ;
 6. clic sur **Start Fishing** si le panneau « Fishing Preparations » est encore affiché ;
