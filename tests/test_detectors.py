@@ -169,6 +169,37 @@ class BannerDetectorTest(unittest.TestCase):
         self.assertLess(det.score(np.full_like(screen, 128)), 0.8)
 
 
+@unittest.skipUnless(TEMPLATE.exists(), "template absent")
+class BannerOtherResolutionTest(unittest.TestCase):
+    """Cas du 08/11 (autre PC, 1920×1080) : l'échelle 0.75 retenue grâce à une petite
+    icône ne convenait pas à la bannière, jamais reconnue. Le texte de la bannière
+    n'est reconnu qu'à moins de 1 % de son échelle exacte : elle cherche la sienne."""
+
+    def setUp(self):
+        self.saved = (hook.UI.candidates, hook.UI.locked, hook.UI.on_lock)
+        hook.UI.on_lock = None
+
+    def tearDown(self):
+        hook.UI.candidates, hook.UI.locked, hook.UI.on_lock = self.saved
+
+    def test_banner_found_whatever_its_exact_scale(self):
+        tpl = cv2.imread(str(TEMPLATE))
+        noise = np.random.default_rng(1).integers(0, 120, (1080, 1920, 3), dtype=np.uint8)
+        for real in (0.66, 0.675, 0.70, 0.72, 0.75, 0.78):
+            hook.UI.configure(1920, 1080)
+            hook.UI.locked = 0.75                       # verrou venu d'une autre image
+            frame = noise.copy()
+            banner = cv2.resize(tpl, None, fx=real, fy=real, interpolation=cv2.INTER_AREA)
+            frame[700:700 + banner.shape[0], 600:600 + banner.shape[1]] = banner
+            detector = BannerDetector(TEMPLATE, 0.8, (0.9, 1.0, 1.1))
+            score, box = detector.locate(frame)
+            self.assertGreater(score, 0.9, f"échelle réelle {real}")
+            self.assertAlmostEqual(detector.locked, real, delta=real * 0.008)
+            self.assertLess(abs(box[0] - 600) + abs(box[1] - 700), 6)
+            self.assertGreater(detector.locate(frame)[0], 0.9)    # échelle retenue
+            self.assertLess(detector.locate(noise)[0], 0.6)       # pas de fausse détection
+
+
 class ScreenCaptureTest(unittest.TestCase):
     def test_grab_returns_bgr_image(self):
         try:

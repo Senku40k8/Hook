@@ -1,5 +1,9 @@
 # Hook
 
+> **⚠ Le jeu doit être en anglais.** Le bot reconnaît les textes de l'écran (« Fish on the
+> hook! », « Fishing », « Purchase », « Switch »…) tels qu'ils s'affichent en anglais : dans
+> une autre langue, rien n'est détecté. Langue du texte à régler dans les options du jeu.
+
 ## ▶ Lancer le bot
 
 Dans **PowerShell**, depuis le dossier du projet :

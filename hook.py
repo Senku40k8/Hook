@@ -879,6 +879,9 @@ class BannerDetector:
         self.base = template
         self.base_scales = tuple(scales)
         self._cache: Dict[float, np.ndarray] = {}
+        self._coarse_cache: Dict[float, np.ndarray] = {}
+        self.locked: Optional[float] = None     # échelle propre (grandes images, voir _wide)
+        self.name = Path(template_path).stem
 
     def scaled_templates(self) -> List[Tuple[float, np.ndarray]]:
         """(échelle, image) à essayer, selon l'échelle de l'interface (voir UiScale)."""
@@ -901,6 +904,8 @@ class BannerDetector:
     def locate(self, frame_bgr: np.ndarray) -> Tuple[float, Optional[Region]]:
         """Meilleur score (0..1) et rectangle (x, y, w, h) correspondant dans l'image."""
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        if self._wide():
+            return self._locate_wide(gray)
         if self.edges:
             gray = edge_map(gray)
         best, box, best_scale = 0.0, None, 1.0
@@ -913,6 +918,82 @@ class BannerDetector:
                 best, box, best_scale = float(value), (x, y, tpl.shape[1], tpl.shape[0]), scale
         if box is not None and best >= self.threshold and not self.edges:
             UI.confirm(best_scale, best)
+        return best, box
+
+    # --- Grandes images de texte (bannière « Fish on the hook! ») --------------
+    # Un texte de ~700 px ne se reconnaît qu'à l'échelle exacte : 1 % d'écart fait
+    # chuter le score de 0.98 à 0.5. Hors 2560×1600, on cherche donc l'échelle en
+    # deux temps : passe grossière (image réduite et floutée, tolérante, pas de
+    # 2 %), puis passe fine (pas de 0.5 %) autour de l'endroit trouvé. L'échelle
+    # obtenue est retenue pour cette image seulement : une petite icône reconnue
+    # « à peu près » ne doit pas imposer son échelle à la bannière.
+    WIDE_PX = 300                           # largeur (à l'écran) à partir de laquelle
+    COARSE_MIN = 0.55                       # score grossier minimal pour affiner
+
+    def _wide(self) -> bool:
+        return (not self.edges and bool(UI.candidates)
+                and self.base.shape[1] * min(UI.candidates) >= self.WIDE_PX)
+
+    def _scaled(self, s: float) -> np.ndarray:
+        tpl = self._cache.get(s)
+        if tpl is None:
+            tpl = cv2.resize(self.base, None, fx=s, fy=s,
+                             interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+            self._cache[s] = tpl
+        return tpl
+
+    @staticmethod
+    def _blur_half(gray: np.ndarray) -> np.ndarray:
+        half = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        return cv2.GaussianBlur(half, (0, 0), 2)
+
+    def _coarse_scales(self) -> List[float]:
+        known = list(UI.candidates) + ([UI.locked] if UI.locked else [])
+        lo, hi = min(known) * 0.97, max(known) * 1.03
+        out, s = [], lo
+        while s <= hi:
+            out.append(round(s, 4))
+            s *= 1.02
+        return out
+
+    def _best(self, gray: np.ndarray, scales: Sequence[float],
+              coarse: bool = False) -> Tuple[float, Optional[Region], float]:
+        best, box, best_scale = 0.0, None, 0.0
+        for s in scales:
+            if coarse:
+                tpl = self._coarse_cache.get(s)
+                if tpl is None:
+                    tpl = self._coarse_cache[s] = self._blur_half(self._scaled(s))
+            else:
+                tpl = self._scaled(s)
+            if tpl.shape[0] > gray.shape[0] or tpl.shape[1] > gray.shape[1]:
+                continue
+            _, value, _, (x, y) = cv2.minMaxLoc(cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED))
+            if value > best:
+                best, box, best_scale = float(value), (x, y, tpl.shape[1], tpl.shape[0]), s
+        return best, box, best_scale
+
+    def _locate_wide(self, gray: np.ndarray) -> Tuple[float, Optional[Region]]:
+        if self.locked is not None:
+            s = self.locked
+            best, box, scale = self._best(gray, (round(s * 0.995, 4), s, round(s * 1.005, 4)))
+        else:
+            coarse, cbox, s0 = self._best(self._blur_half(gray), self._coarse_scales(), coarse=True)
+            if cbox is None or coarse < self.COARSE_MIN:
+                return coarse, None
+            # Zone d'affinage autour de la position grossière (coordonnées pleine taille).
+            x, y, w, h = (2 * v for v in cbox)
+            mx, my = int(w * 0.05) + 16, int(h * 0.3) + 16
+            x0, y0 = max(0, x - mx), max(0, y - my)
+            roi = gray[y0:y + h + my, x0:x + w + mx]
+            best, box, scale = self._best(roi, [round(s0 * (1 + 0.005 * k), 4) for k in range(-4, 5)])
+            if box is not None:
+                box = (box[0] + x0, box[1] + y0, box[2], box[3])
+            if box is not None and best >= max(self.threshold, UI.LOCK_SCORE):
+                self.locked = scale
+                log.info("Échelle de %s : %.3f (score %.2f).", self.name, scale, best)
+        if box is not None and best >= self.threshold:
+            UI.confirm(scale, best)
         return best, box
 
     def score(self, frame_bgr: np.ndarray) -> float:
@@ -1255,11 +1336,15 @@ def wait_for_banner(cfg: Config, detector: BannerDetector,
     log.info("Attente de la bannière…")
     deadline = time.perf_counter() + cfg.banner_timeout
     scans = 0
+    best_score, best_frame = -1.0, None
     while time.perf_counter() < deadline:
         check_stop()
         wait_for_focus()
         region = cfg.banner_region or search_region()
-        score, box = detector.locate(grab(region))
+        frame = grab(region)
+        score, box = detector.locate(frame)
+        if score > best_score:
+            best_score, best_frame = score, frame
         if score >= detector.threshold:
             log.info("Bannière détectée (score %.2f).", score)
             if cfg.banner_region is None and cfg.auto_lock_regions and box:
@@ -1273,7 +1358,30 @@ def wait_for_banner(cfg: Config, detector: BannerDetector,
             return "no_bait"
         scans += 1
         sleep(cfg.scan_interval)
+    save_banner_miss(best_score, best_frame)
     return None
+
+
+_banner_miss_saved = False
+
+
+def save_banner_miss(score: float, frame: Optional[np.ndarray]) -> None:
+    """Bannière jamais reconnue : garde (une fois par lancement) l'image la plus
+    ressemblante dans debug/, pour comprendre pourquoi."""
+    global _banner_miss_saved
+    if frame is None:
+        return
+    log.info("Meilleur score de la bannière pendant l'attente : %.2f.", score)
+    if _banner_miss_saved:
+        return
+    _banner_miss_saved = True
+    try:
+        out = Path("debug") / f"banner_missed_{time.strftime('%H%M%S')}.png"
+        out.parent.mkdir(exist_ok=True)
+        cv2.imwrite(str(out), frame)
+        log.info("Capture enregistrée : %s", out)
+    except Exception as exc:                # diagnostic seulement : jamais bloquant
+        log.debug("Capture impossible : %s", exc)
 
 
 def wait_for_gauge(cfg: Config, detector: GaugeDetector) -> bool:
