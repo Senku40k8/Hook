@@ -16,6 +16,22 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import hook  # noqa: E402
+
+
+def setUpModule():
+    """Tests indépendants du vrai clavier et de la vraie souris (Échap, F8, souris
+    dans un coin) : un appui pendant les tests, ou le bot lancé en parallèle,
+    ne doit pas les interrompre. PauseKeyTest remplace _key_state à sa façon."""
+    global _saved_inputs
+    _saved_inputs = (hook._key_state, hook._visible_cursor_in_corner)
+    hook._key_state = lambda vk: 0
+    hook._visible_cursor_in_corner = lambda: False
+
+
+def tearDownModule():
+    hook._key_state, hook._visible_cursor_in_corner = _saved_inputs
+
+
 from session import (  # noqa: E402
     CycleRecord, HumanConfig, Humanizer, SessionConfig, SessionPlanner, Stats,
     format_duration, parse_duration,
@@ -436,8 +452,10 @@ class FakeShop:
         elif key == "e" and s in ("fishing_mode", "equip_banner"):
             self.origin = "fishing_mode"
             self.screen = "dialog"
-        elif key == "q" and s in ("fishing_mode", "slot_empty", "equip_banner"):
-            self.menu_origin = "fishing_mode" if s == "equip_banner" else s
+        elif key == "q" and s in ("fishing_mode", "equip_banner"):
+            # Q (vente) ne marche qu'en mode pêche, pas sur le panneau de
+            # préparation (capture du 08/11 à 10:14).
+            self.menu_origin = "fishing_mode"
             self.screen = "menu"
         elif key == "esc":
             menu_origin = getattr(self, "menu_origin", "fishing_mode")
@@ -644,6 +662,31 @@ class ResolutionTest(unittest.TestCase):
         hook.UI.configure(2560, 1600)
         self.assertEqual(hook.UI.scales((0.9, 1.0, 1.1)), (0.9, 1.0, 1.1))   # inchangé
 
+    def test_parse_resolution(self):
+        self.assertEqual(hook.parse_resolution("1920x1080"), (1920, 1080))
+        self.assertEqual(hook.parse_resolution("2560×1440"), (2560, 1440))
+        with self.assertRaises(ValueError):
+            hook.parse_resolution("1080p")
+        args = hook.parse_args(["-r", "1920x1080"])
+        self.assertEqual(hook.build_config(args).resolution, (1920, 1080))
+
+    def test_default_is_2560x1600_without_scaling(self):
+        """Sans -r : 2560×1600 et tolérance d'origine, même si la fenêtre diffère."""
+        saved_target = hook.target
+
+        class Window:
+            def client_region(self):
+                return (0, 0, 1920, 1080)
+        hook.target = Window()
+        try:
+            hook.configure_ui_scale(hook.Config(config_path=None))
+            self.assertEqual(hook.UI.scales((0.9, 1.0, 1.1)), (0.9, 1.0, 1.1))
+            cfg = hook.Config(config_path=None, resolution=(1920, 1080))
+            hook.configure_ui_scale(cfg)
+            self.assertIn(round(1080 / 1600, 3), hook.UI.scales((1.0,)))
+        finally:
+            hook.target = saved_target
+
     def test_saved_scale_is_reused(self):
         hook.UI.configure(1920, 1080, saved=0.7)
         self.assertEqual(hook.UI.scales((1.0,))[1], 0.7)
@@ -727,13 +770,25 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(self.shop.screen, "equipped")
         self.assertEqual(self.shop.stock, 98)               # 99 achetés, 1 équipé
 
-    def test_no_bait_from_preparations_panel(self):
+    def test_no_bait_from_preparations_panel_buys_directly(self):
+        """Cas du 08/11 à 10:14 : sur le panneau de préparation, Q (vente) ne fait
+        rien. Le bot achète directement avec ses coquillages, sans Cancel ni Q."""
+        self.shop.shells = 100
         self.shop.screen = "slot_empty"
         record = self.cycle()
         self.assertEqual(record.outcome, "restock")
         slot = ["bait_slot_empty"]
-        self.assertEqual(self.shop.clicks, slot + self.SELL + slot + self.BUY + slot + self.EQUIP)
+        self.assertEqual(self.shop.clicks, slot + self.BUY + slot + self.EQUIP)
+        self.assertNotIn("q", self.shop.keys)
         self.assertEqual(self.shop.screen, "equipped")
+
+    def test_no_bait_no_shells_on_panel_stops_with_clear_message(self):
+        self.shop.screen = "slot_empty"
+        self.cfg.restock_step_timeout = 0.5
+        with self.assertRaises(hook.BlockedStop) as ctx:
+            self.cycle()
+        self.assertIn("coquillages", str(ctx.exception))
+        self.assertNotIn("q", self.shop.keys)
 
     def test_sell_comes_before_any_purchase(self):
         self.cycle()
@@ -828,6 +883,7 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(self.shop.keys, [])
 
     def test_fishing_prompt_without_bait_goes_to_restock(self):
+        self.shop.shells = 100                        # achat direct depuis le panneau
         self.shop.screen, self.shop.after_spot = "spot", "slot_empty"
         record = self.cycle()
         self.assertEqual(record.outcome, "restock")

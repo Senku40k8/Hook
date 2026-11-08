@@ -92,8 +92,10 @@ class Config:
     # Titre de la fenêtre du jeu : mémorisé au premier lancement, le bot la met
     # ensuite lui-même au premier plan.
     window_title: Optional[str] = None
-    # Échelle de l'interface (autre résolution que 2560×1600), déterminée
-    # automatiquement et mémorisée pour la taille de fenêtre ui_scale_size.
+    # Résolution du jeu (--resolution / -r). None = 2560×1600, celle des images de
+    # référence (tolérance ±10 %). Autre valeur : les images sont mises à
+    # l'échelle, et l'échelle exacte est retenue puis mémorisée (ui_scale).
+    resolution: Optional[Tuple[int, int]] = None
     ui_scale: Optional[float] = None
     ui_scale_size: Optional[Tuple[int, int]] = None
     config_path: Optional[Path] = None      # où mémoriser les zones (non persisté)
@@ -1517,19 +1519,22 @@ class Restocker:
         """True si la case d'appât vide (« Not Selected ») est visible."""
         return self.buttons["bait_slot_empty"].detect(grab(search_region()))
 
-    def open_bait_dialog(self) -> None:
+    def open_bait_dialog(self) -> str:
         """Ouvre la fenêtre « Switch Bait » : clic sur la case d'appât vide si le
         panneau « Fishing Preparations » est affiché, sinon touche E (en mode
-        pêche, E ouvre directement cette fenêtre)."""
+        pêche, E ouvre directement cette fenêtre).
+
+        Renvoie "panel" (depuis le panneau, hors mode pêche) ou "fishing"."""
         try:
             box = self.wait_for_button("bait_slot_empty", timeout=1.0, quiet=True)
         except RestockFailed:
             log.info("  touche %s (fenêtre « Switch Bait »)", self.cfg.bait_menu_key.upper())
             tap(self.cfg.bait_menu_key, self.cfg.action_press_duration)
-            return
+            return "fishing"
         sleep(human.reaction())
         log.info("  clic sur la case d'appât")
         click_box(click_area("bait_slot_empty", box))
+        return "panel"
 
     def dismiss_popup(self, name: str) -> None:
         """Ferme une fenêtre du type « Rewards » en cliquant dans une zone vide."""
@@ -1634,13 +1639,20 @@ class Restocker:
         log.info("Aucun appât équipé : ouverture de « Switch Bait »…")
         try:
             sleep(human.within(self.cfg.restock_step_delay))
-            self.open_bait_dialog()
+            opened_from = self.open_bait_dialog()
             if self.wait_for_any(("switch", "purchase")) == "switch":
                 log.info("Appâts en stock : équipement direct.")
                 self._run_steps(EQUIP_STEPS)
+            elif opened_from == "panel":
+                # Panneau « Fishing Preparations » : hors mode pêche, Q (vente) n'y
+                # fait rien et on ne peut pas y entrer sans appât -> achat direct
+                # avec les coquillages disponibles.
+                log.info("Plus d'appâts (panneau de préparation, vente impossible ici) : "
+                         "achat d'Universal Bait puis équipement.")
+                self._run_steps(BUY_STEPS)
             else:
-                log.info("Plus d'appâts : vente des poissons (coquillages), puis achat "
-                         "d'Universal Bait, puis équipement.")
+                log.info("Plus d'appâts en mode pêche : vente des poissons (coquillages), "
+                         "puis achat d'Universal Bait, puis équipement.")
                 self._run_steps(SELL_STEPS)
                 if self.wait_for_any(("purchase", "switch")) == "switch":
                     self._run_steps(EQUIP_STEPS)
@@ -1726,7 +1738,10 @@ def restock_or_stop(cfg: Config, restocker: Optional[Restocker]) -> None:
     try:
         restocker.run()
     except RestockFailed as exc:
-        raise BlockedStop(f"réapprovisionnement impossible ({exc})") from None
+        hint = ""
+        if "confirm" in str(exc) or "universal_bait" in str(exc):
+            hint = " ; plus assez de coquillages, ou Universal Bait épuisé pour aujourd'hui ?"
+        raise BlockedStop(f"réapprovisionnement impossible ({exc}){hint}") from None
 
 
 def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number: int,
@@ -1938,6 +1953,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="affiche les titres des fenêtres ouvertes puis quitte")
     p.add_argument("--duration", metavar="DURÉE",
                    help="arrêt après cette durée (ex. 2h, 1h30, 90m)")
+    p.add_argument("-r", "--resolution", metavar="LxH",
+                   help="résolution du jeu si ce n'est pas 2560x1600 (ex. -r 1920x1080)")
     p.add_argument("--max-fish", type=int, metavar="N", help="arrêt après N poissons")
     p.add_argument("--max-failures", type=int, metavar="N",
                    help="arrêt après N cycles ratés de suite (défaut 3)")
@@ -1974,6 +1991,8 @@ def build_config(args: argparse.Namespace) -> Config:
         cfg.window_title = args.window
     if args.record:
         cfg.record_dir = Path("debug") / "track"
+    if args.resolution:
+        cfg.resolution = parse_resolution(args.resolution)
     if args.duration:
         cfg.session.max_duration = parse_duration(args.duration)
     if args.max_fish:
@@ -1987,16 +2006,37 @@ def build_config(args: argparse.Namespace) -> Config:
     return cfg
 
 
+def parse_resolution(text: str) -> Tuple[int, int]:
+    """« 1920x1080 » (ou 1920×1080, 1920*1080) -> (1920, 1080)."""
+    import re
+    m = re.fullmatch(r"\s*(\d{3,5})\s*[x×*]\s*(\d{3,5})\s*", text, re.IGNORECASE)
+    if not m:
+        raise ValueError(f"Résolution invalide : « {text} » (ex. 1920x1080)")
+    return int(m.group(1)), int(m.group(2))
+
+
 def configure_ui_scale(cfg: Config) -> None:
-    """Adapte la reconnaissance d'images à la résolution de la fenêtre du jeu."""
-    width, height = search_region()[2:]
-    size = (int(width), int(height))
+    """Adapte la reconnaissance d'images à la résolution du jeu.
+
+    Par défaut : 2560×1600, la résolution des images de référence (tolérance
+    ±10 %). Autre résolution : à indiquer avec --resolution / -r."""
+    reference = UiScale.REFERENCE
+    window = tuple(int(v) for v in search_region()[2:])
+    size = tuple(cfg.resolution) if cfg.resolution else reference
+    if size == reference:
+        UI.configure(*reference)                # rien à adapter
+        if abs(window[0] - reference[0]) > 0.15 * reference[0] or \
+                abs(window[1] - reference[1]) > 0.15 * reference[1]:
+            log.warning("La fenêtre du jeu fait %d×%d, mais le bot attend 2560×1600. "
+                        "Relancez avec la résolution du jeu, ex. : .\\start.bat -r %dx%d",
+                        window[0], window[1], window[0], window[1])
+        return
     saved = cfg.ui_scale if cfg.ui_scale_size and tuple(cfg.ui_scale_size) == size else None
     if cfg.ui_scale_size and tuple(cfg.ui_scale_size) != size and (cfg.banner_region or cfg.gauge_region):
         # Autre résolution que la dernière fois : les zones mémorisées ne valent plus.
         cfg.banner_region = cfg.gauge_region = None
         log.info("Résolution changée : zones mémorisées oubliées.")
-    UI.configure(width, height, saved)
+    UI.configure(size[0], size[1], saved)
 
     def remember(scale: float) -> None:
         cfg.ui_scale, cfg.ui_scale_size = scale, size

@@ -43,12 +43,16 @@ lui-même au premier plan.
 
 > **Conditions pour un autre PC**
 >
-> - **Toutes les résolutions.** Les images de référence (`templates/`) viennent d'un écran
->   2560×1600. Sur une autre résolution (1920×1080, 2560×1440, ultra-large, fenêtré…), le
->   bot adapte leur taille à celle de la fenêtre du jeu. Il retient l'échelle exacte dès
->   qu'il reconnaît un élément avec certitude, et la mémorise pour cette résolution.
->   Au premier lancement dans une nouvelle résolution, les premières recherches sont un
->   peu plus lentes.
+> - **Résolution.** Par défaut, le bot attend **2560×1600**, la résolution des images de
+>   référence. Dans une autre résolution, indiquez-la avec `-r` :
+>
+>   ```powershell
+>   .\start.bat -r 1920x1080
+>   ```
+>
+>   Le bot adapte alors la taille des images. Il retient l'échelle exacte dès qu'il
+>   reconnaît un élément avec certitude, et la mémorise. Si la fenêtre du jeu n'a pas la
+>   taille attendue, le bot affiche au démarrage la commande `-r` à utiliser.
 > - **Clavier AZERTY.** Le bot tire à gauche avec la touche Q d'un clavier AZERTY. Sur un
 >   clavier QWERTY, le jeu attend probablement A.
 > - **Jeu en anglais.** Le bot reconnaît les textes « Purchase », « Switch », « Confirm »…
@@ -109,11 +113,15 @@ Le bot ouvre d'abord la fenêtre **Switch Bait** et regarde ce qu'elle propose :
 
 - **Cancel / Switch** : il reste des appâts, non équipés. Le bot clique sur **Switch**, puis
   sur **Start Fishing** si besoin. Il n'achète rien.
-- **Cancel / Purchase** : il n'y a plus d'appâts. Le bot **vend d'abord les poissons** pour
-  avoir des coquillages, puis il achète et équipe. Tout se fait **sans quitter le mode
-  pêche** : sans appât, on ne pourrait plus relancer « Start Fishing ».
+- **Cancel / Purchase** : il n'y a plus d'appâts.
+  - **En mode pêche** (appâts épuisés en cours de partie) : le bot **vend d'abord les
+    poissons** pour avoir des coquillages, puis il achète et équipe. Tout se fait **sans
+    quitter le mode pêche**, car sans appât, on ne pourrait plus relancer « Start Fishing ».
+  - **Sur le panneau « Fishing Preparations »** : la vente est impossible, car `Q` n'y fait
+    rien. Le bot achète donc directement avec les coquillages disponibles, puis équipe.
+    S'il n'y en a pas assez, il s'arrête avec une alerte.
 
-Vente (depuis le mode pêche) :
+Vente (depuis le mode pêche seulement) :
 
 1. clic sur **Cancel** pour fermer « Switch Bait » ;
 2. `Q`, clic sur **Quick Submit** (et fermeture de « Rewards » si elle apparaît) ;
@@ -193,6 +201,7 @@ ignorés pendant le choix. Le bot ne travaille ensuite que dans cette fenêtre :
 
 ```powershell
 .\start.bat                          # boucle infinie
+.\start.bat -r 1920x1080             # jeu dans une autre résolution que 2560x1600
 .\start.bat --duration 2h            # 2 heures, puis arrêt avec un bip
 .\start.bat --max-fish 100           # 100 poissons, puis arrêt
 .\start.bat --record -v              # enregistre le suivi annoté dans debug/track/

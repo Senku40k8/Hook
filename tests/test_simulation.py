@@ -179,8 +179,10 @@ class FakeNTE:
             self.yellow += (-1 if key == "q" else 1) * 0.015 * self.W
         elif key == "e" and m in ("fishing", "equip_banner"):
             self.origin, self.mode = "fishing", "dialog"
-        elif key == "q" and m in ("fishing", "equip_banner", "prep"):
-            self.menu_origin = "prep" if m == "prep" else "fishing"
+        elif key == "q" and m in ("fishing", "equip_banner"):
+            # Vente seulement en mode pêche : Q ne fait rien sur le panneau de
+            # préparation (capture du 08/11 à 10:14).
+            self.menu_origin = "fishing"
             self.mode = "menu"
         elif key == "esc":
             if m in ("shop", "shop_item", "shop_max", "buy_confirm", "shop_done"):
@@ -249,11 +251,18 @@ class SimulationTest(unittest.TestCase):
 
     def setUp(self):
         self.saved = (hook.grab, hook.keyboard, hook.human, hook.target, hook.click_box,
-                      hook.UI.candidates, hook.UI.locked, hook.UI.on_lock)
+                      hook.UI.candidates, hook.UI.locked, hook.UI.on_lock,
+                      hook._key_state, hook._visible_cursor_in_corner)
+        # Indépendant du vrai clavier et de la vraie souris : Échap, F8 ou la souris
+        # dans un coin pendant les tests (ou le bot lancé en parallèle) ne doivent
+        # pas interrompre la simulation.
+        hook._key_state = lambda vk: 0
+        hook._visible_cursor_in_corner = lambda: False
 
     def tearDown(self):
         (hook.grab, hook.keyboard, hook.human, hook.target, hook.click_box,
-         hook.UI.candidates, hook.UI.locked, hook.UI.on_lock) = self.saved
+         hook.UI.candidates, hook.UI.locked, hook.UI.on_lock,
+         hook._key_state, hook._visible_cursor_in_corner) = self.saved
 
     def run_bot(self, game, cycles):
         hook.grab = game.grab
@@ -272,6 +281,8 @@ class SimulationTest(unittest.TestCase):
         cfg.scan_interval = 0.0
         cfg.gauge_lost_grace = 0.0
         cfg.banner_timeout, cfg.gauge_appear_timeout, cfg.restock_step_timeout = 4.0, 3.0, 3.0
+        if (game.W, game.H) != (2560, 1600):
+            cfg.resolution = (game.W, game.H)          # comme « .\start.bat -r 1920x1080 »
         hook.configure_ui_scale(cfg)
         stats = Stats(None)
         banner = hook.BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)
@@ -345,6 +356,28 @@ class SimulationTest(unittest.TestCase):
             self.assertLess(game.events.index("clic quick_sell"),
                             game.events.index("clic universal_bait"))   # vente avant achat
             self.check_no_exit(game)
+        self.for_each_resolution(scenario)
+
+    def test_launched_at_spot_without_bait_buys_from_panel(self):
+        """Cas du 08/11 à 10:14 : invite « Fishing » -> F -> panneau sans appât.
+        Pas de vente possible ici : achat direct, équipement, Start Fishing, pêche."""
+        def scenario(w, h):
+            game = FakeNTE(w, h, mode="spot", equipped=False, stock=0, shells=100)
+            stats, error = self.run_bot(game, cycles=3)
+            self.assertIsNone(error, game.events)
+            self.assertEqual([r.outcome for r in stats.records], ["restock", "unknown", "unknown"])
+            self.assertNotIn("clic cancel", game.events)
+            self.assertNotIn("clic quick_submit", game.events)   # pas de vente depuis le panneau
+            self.assertEqual(game.fish, 2, game.events)
+        self.for_each_resolution(scenario)
+
+    def test_launched_at_spot_without_bait_nor_shells(self):
+        def scenario(w, h):
+            game = FakeNTE(w, h, mode="spot", equipped=False, stock=0, shells=0)
+            stats, error = self.run_bot(game, cycles=3)
+            self.assertIsInstance(error, hook.BlockedStop)
+            self.assertIn("coquillages", str(error))
+            self.assertNotIn("clic quick_submit", game.events)
         self.for_each_resolution(scenario)
 
     def test_no_bait_no_shells_stops_inside_fishing_mode(self):
