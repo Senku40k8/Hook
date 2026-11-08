@@ -94,9 +94,9 @@ class Config:
     window_title: Optional[str] = None
     # Résolution du jeu (--resolution / -r). None = 2560×1600, celle des images de
     # référence (tolérance ±10 %). Autre valeur : les images sont mises à
-    # l'échelle, et l'échelle exacte est retenue puis mémorisée (ui_scale).
+    # l'échelle, et l'échelle exacte est retenue puis mémorisée (ui_scale_exact).
     resolution: Optional[Tuple[int, int]] = None
-    ui_scale: Optional[float] = None
+    ui_scale_exact: Optional[float] = None
     ui_scale_size: Optional[Tuple[int, int]] = None
     config_path: Optional[Path] = None      # où mémoriser les zones (non persisté)
     record_dir: Optional[Path] = None       # --record : images annotées du suivi
@@ -192,7 +192,7 @@ PERSISTED_FIELDS = (
     "banner_region", "gauge_region",
     "green_lower", "green_upper", "yellow_lower", "yellow_upper",
     "invert_controls", "input_backend", "window_title", "line_speed",
-    "ui_scale", "ui_scale_size",
+    "ui_scale_exact", "ui_scale_size",
 )
 
 
@@ -810,9 +810,11 @@ class UiScale:
     """Échelle de l'interface du jeu par rapport aux images de référence.
 
     Les images de templates/ viennent d'un écran 2560×1600. Sur une autre
-    résolution, l'interface est plus petite ou plus grande : on cherche d'abord
-    aux échelles plausibles (hauteur et largeur de la fenêtre, ±6 %), puis on
-    retient l'échelle exacte dès qu'une image est reconnue avec certitude.
+    résolution, l'interface est plus petite ou plus grande : chaque image cherche
+    son échelle exacte parmi les échelles plausibles (hauteur et largeur de la
+    fenêtre, ±6 %, voir BannerDetector._locate_adaptive). La première échelle
+    exacte trouvée (locked) sert ensuite de point de départ aux autres images,
+    le jeu mettant toute son interface à la même échelle.
     """
 
     REFERENCE = (2560, 1600)                # résolution des images de référence
@@ -884,9 +886,18 @@ class BannerDetector:
         self.name = Path(template_path).stem
 
     def scaled_templates(self) -> List[Tuple[float, np.ndarray]]:
-        """(échelle, image) à essayer, selon l'échelle de l'interface (voir UiScale)."""
+        """(échelle, image) à essayer, selon l'échelle de l'interface (voir UiScale).
+        Contours (icônes) hors 2560×1600 : toute la plage d'échelles plausibles,
+        puis l'échelle retenue pour cette icône."""
+        if self.edges and UI.candidates:
+            if self.locked is not None:
+                scales = (round(self.locked * 0.98, 4), self.locked, round(self.locked * 1.02, 4))
+            else:
+                scales = tuple(self._coarse_scales())
+        else:
+            scales = UI.scales(self.base_scales)
         out = []
-        for s in UI.scales(self.base_scales):
+        for s in scales:
             tpl = self._cache.get(s)
             if tpl is None:
                 tpl = self.base if s == 1.0 else cv2.resize(
@@ -904,8 +915,8 @@ class BannerDetector:
     def locate(self, frame_bgr: np.ndarray) -> Tuple[float, Optional[Region]]:
         """Meilleur score (0..1) et rectangle (x, y, w, h) correspondant dans l'image."""
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        if self._wide():
-            return self._locate_wide(gray)
+        if self._adaptive():
+            return self._locate_adaptive(gray)
         if self.edges:
             gray = edge_map(gray)
         best, box, best_scale = 0.0, None, 1.0
@@ -916,23 +927,41 @@ class BannerDetector:
             _, value, _, (x, y) = cv2.minMaxLoc(result)
             if value > best:
                 best, box, best_scale = float(value), (x, y, tpl.shape[1], tpl.shape[0]), scale
-        if box is not None and best >= self.threshold and not self.edges:
-            UI.confirm(best_scale, best)
+        if box is not None and best >= self.threshold:
+            if self.edges:
+                if UI.candidates and self.locked is None and best >= self.threshold + 0.1:
+                    self.locked = best_scale
+            else:
+                UI.confirm(best_scale, best)
         return best, box
 
-    # --- Grandes images de texte (bannière « Fish on the hook! ») --------------
-    # Un texte de ~700 px ne se reconnaît qu'à l'échelle exacte : 1 % d'écart fait
-    # chuter le score de 0.98 à 0.5. Hors 2560×1600, on cherche donc l'échelle en
-    # deux temps : passe grossière (image réduite et floutée, tolérante, pas de
-    # 2 %), puis passe fine (pas de 0.5 %) autour de l'endroit trouvé. L'échelle
-    # obtenue est retenue pour cette image seulement : une petite icône reconnue
-    # « à peu près » ne doit pas imposer son échelle à la bannière.
-    WIDE_PX = 300                           # largeur (à l'écran) à partir de laquelle
-    COARSE_MIN = 0.55                       # score grossier minimal pour affiner
+    # --- Autre résolution que 2560×1600 : échelle exacte de chaque image --------
+    # Beaucoup d'images ne se reconnaissent qu'à leur échelle exacte : 2 % d'écart
+    # fait tomber la case « Not Selected » de 1.00 à 0.79, la bannière de 0.98 à
+    # 0.5. On cherche donc l'échelle en deux temps : passe grossière (image
+    # floutée, tolérante, pas de 2 %), puis passe fine (pas de 0.5 %) autour de
+    # l'endroit trouvé. L'échelle obtenue est retenue pour cette image (self.locked).
+    WIDE_PX = 300                           # au-delà : passe grossière à mi-résolution
+    COARSE_MIN = 0.45                       # score grossier minimal pour affiner
+    COARSE_PEAKS = 3                        # endroits grossiers examinés en passe fine
 
-    def _wide(self) -> bool:
-        return (not self.edges and bool(UI.candidates)
-                and self.base.shape[1] * min(UI.candidates) >= self.WIDE_PX)
+    def _adaptive(self) -> bool:
+        return not self.edges and bool(UI.candidates)
+
+    def _halve(self) -> bool:
+        """Passe grossière à mi-résolution (4× plus rapide) si l'image reste assez
+        grande une fois réduite ; sinon pleine résolution."""
+        return min(self.base.shape[:2]) * min(UI.candidates) >= 36
+
+    def _coarse_prep(self, gray: np.ndarray) -> np.ndarray:
+        if self._halve():
+            half = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            wide = self.base.shape[1] * min(UI.candidates) >= self.WIDE_PX
+            return cv2.GaussianBlur(half, (0, 0), 2 if wide else 1)
+        return cv2.GaussianBlur(gray, (0, 0), 1.2)
+
+    def _lock_scores(self) -> float:
+        return max(self.threshold, 0.85)
 
     def _scaled(self, s: float) -> np.ndarray:
         tpl = self._cache.get(s)
@@ -942,30 +971,26 @@ class BannerDetector:
             self._cache[s] = tpl
         return tpl
 
-    @staticmethod
-    def _blur_half(gray: np.ndarray) -> np.ndarray:
-        half = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-        return cv2.GaussianBlur(half, (0, 0), 2)
+    FULL_SWEEP_EVERY = 8                    # échelle connue : plage complète 1 fois sur 8
 
     def _coarse_scales(self) -> List[float]:
+        self._sweeps = getattr(self, "_sweeps", 0) + 1
+        if UI.locked and self._sweeps % self.FULL_SWEEP_EVERY:
+            # Échelle de l'interface déjà connue : autour d'elle seulement (rapide).
+            s = UI.locked
+            return [round(s / 1.025, 4), s, round(s * 1.025, 4)]
         known = list(UI.candidates) + ([UI.locked] if UI.locked else [])
         lo, hi = min(known) * 0.97, max(known) * 1.03
         out, s = [], lo
         while s <= hi:
             out.append(round(s, 4))
-            s *= 1.02
+            s *= 1.025                      # la passe fine couvre ±2 %
         return out
 
-    def _best(self, gray: np.ndarray, scales: Sequence[float],
-              coarse: bool = False) -> Tuple[float, Optional[Region], float]:
+    def _best(self, gray: np.ndarray, scales: Sequence[float]) -> Tuple[float, Optional[Region], float]:
         best, box, best_scale = 0.0, None, 0.0
         for s in scales:
-            if coarse:
-                tpl = self._coarse_cache.get(s)
-                if tpl is None:
-                    tpl = self._coarse_cache[s] = self._blur_half(self._scaled(s))
-            else:
-                tpl = self._scaled(s)
+            tpl = self._scaled(s)
             if tpl.shape[0] > gray.shape[0] or tpl.shape[1] > gray.shape[1]:
                 continue
             _, value, _, (x, y) = cv2.minMaxLoc(cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED))
@@ -973,27 +998,51 @@ class BannerDetector:
                 best, box, best_scale = float(value), (x, y, tpl.shape[1], tpl.shape[0]), s
         return best, box, best_scale
 
-    def _locate_wide(self, gray: np.ndarray) -> Tuple[float, Optional[Region]]:
+    def _coarse_peaks(self, gray: np.ndarray) -> List[Tuple[float, Region, float]]:
+        """Meilleurs endroits (score, rectangle pleine taille, échelle) en passe grossière."""
+        prep = self._coarse_prep(gray)
+        factor = 2 if self._halve() else 1
+        peaks: List[Tuple[float, Region, float]] = []
+        for s in self._coarse_scales():
+            tpl = self._coarse_cache.get(s)
+            if tpl is None:
+                tpl = self._coarse_cache[s] = self._coarse_prep(self._scaled(s))
+            th, tw = tpl.shape[:2]
+            if th > prep.shape[0] or tw > prep.shape[1]:
+                continue
+            result = cv2.matchTemplate(prep, tpl, cv2.TM_CCOEFF_NORMED)
+            for _ in range(self.COARSE_PEAKS):
+                _, value, _, (x, y) = cv2.minMaxLoc(result)
+                if value < self.COARSE_MIN:
+                    break
+                peaks.append((float(value), (x * factor, y * factor, tw * factor, th * factor), s))
+                result[max(0, y - th // 2):y + th // 2 + 1, max(0, x - tw // 2):x + tw // 2 + 1] = -1
+        peaks.sort(key=lambda p: p[0], reverse=True)
+        unique: List[Tuple[float, Region, float]] = []
+        for peak in peaks:                  # même endroit à plusieurs échelles : le meilleur
+            if all(not boxes_overlap(peak[1], other[1]) for other in unique):
+                unique.append(peak)
+        return unique[:self.COARSE_PEAKS]
+
+    def _locate_adaptive(self, gray: np.ndarray) -> Tuple[float, Optional[Region]]:
         if self.locked is not None:
             s = self.locked
             best, box, scale = self._best(gray, (round(s * 0.995, 4), s, round(s * 1.005, 4)))
         else:
-            coarse, cbox, s0 = self._best(self._blur_half(gray), self._coarse_scales(), coarse=True)
-            if cbox is None or coarse < self.COARSE_MIN:
-                return coarse, None
-            # Zone d'affinage autour de la position grossière (coordonnées pleine taille).
-            x, y, w, h = (2 * v for v in cbox)
-            mx, my = int(w * 0.05) + 16, int(h * 0.3) + 16
-            x0, y0 = max(0, x - mx), max(0, y - my)
-            roi = gray[y0:y + h + my, x0:x + w + mx]
-            best, box, scale = self._best(roi, [round(s0 * (1 + 0.005 * k), 4) for k in range(-4, 5)])
-            if box is not None:
-                box = (box[0] + x0, box[1] + y0, box[2], box[3])
-            if box is not None and best >= max(self.threshold, UI.LOCK_SCORE):
+            best, box, scale = 0.0, None, 0.0
+            for _, (x, y, w, h), s0 in self._coarse_peaks(gray):
+                # Passe fine autour de l'endroit trouvé (pleine résolution).
+                mx, my = int(w * 0.05) + 12, int(h * 0.3) + 12
+                x0, y0 = max(0, x - mx), max(0, y - my)
+                roi = gray[y0:y + h + my, x0:x + w + mx]
+                value, fbox, s = self._best(roi, [round(s0 * (1 + 0.005 * k), 4)
+                                                  for k in range(-4, 5)])
+                if fbox is not None and value > best:
+                    best, box, scale = value, (fbox[0] + x0, fbox[1] + y0, fbox[2], fbox[3]), s
+            if box is not None and best >= self._lock_scores():
                 self.locked = scale
-                log.info("Échelle de %s : %.3f (score %.2f).", self.name, scale, best)
-        if box is not None and best >= self.threshold:
-            UI.confirm(scale, best)
+                log.info("Échelle de « %s » : %.3f (score %.2f).", self.name, scale, best)
+                UI.confirm(scale, best)
         return best, box
 
     def score(self, frame_bgr: np.ndarray) -> float:
@@ -1006,10 +1055,19 @@ class BannerDetector:
         """Toutes les occurrences au-dessus du seuil (ex. deux boutons « Purchase »
         visibles en même temps), de la meilleure à la moins bonne."""
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        if self.edges:
-            gray = edge_map(gray)
+        if self._adaptive():
+            if self.locked is None:         # échelle pas encore connue : la chercher
+                score, box = self._locate_adaptive(gray)
+                if self.locked is None:
+                    return [(score, box)] if box is not None and score >= self.threshold else []
+            s = self.locked
+            templates = [self._scaled(v) for v in (round(s * 0.995, 4), s, round(s * 1.005, 4))]
+        else:
+            if self.edges:
+                gray = edge_map(gray)
+            templates = self.templates
         found: List[Tuple[float, Region]] = []
-        for tpl in self.templates:
+        for tpl in templates:
             th, tw = tpl.shape[:2]
             if th > gray.shape[0] or tw > gray.shape[1]:
                 continue
@@ -1625,6 +1683,12 @@ class Restocker:
         sleep(human.within((1.0, 1.8)))
         return True
 
+    def panel_open(self) -> bool:
+        """True si le panneau « Fishing Preparations » est affiché (bouton « Start
+        Fishing » ou case d'appât vide visible). Là, aucune touche ne fonctionne."""
+        frame = grab(search_region())
+        return any(self.buttons[name].detect(frame) for name in ("start_fishing", "bait_slot_empty"))
+
     def bait_missing(self) -> bool:
         """True si la case d'appât vide (« Not Selected ») est visible."""
         return self.buttons["bait_slot_empty"].detect(grab(search_region()))
@@ -1634,10 +1698,16 @@ class Restocker:
         panneau « Fishing Preparations » est affiché, sinon touche E (en mode
         pêche, E ouvre directement cette fenêtre).
 
-        Renvoie "panel" (depuis le panneau, hors mode pêche) ou "fishing"."""
+        Renvoie "panel" (depuis le panneau, hors mode pêche) ou "fishing".
+        Sur le panneau, les touches (F, E, R…) sont sans effet : souris seulement."""
+        panel = self.panel_open()
         try:
-            box = self.wait_for_button("bait_slot_empty", timeout=1.0, quiet=True)
+            box = self.wait_for_button("bait_slot_empty", quiet=not panel,
+                                       timeout=None if panel else 1.0)
         except RestockFailed:
+            if panel:
+                raise RestockFailed("case d'appât introuvable sur le panneau « Fishing "
+                                    "Preparations » (là, seul un clic fonctionne)") from None
             log.info("  touche %s (fenêtre « Switch Bait »)", self.cfg.bait_menu_key.upper())
             tap(self.cfg.bait_menu_key, self.cfg.action_press_duration)
             return "fishing"
@@ -1894,6 +1964,13 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number:
     # bot sur ce panneau) : « Start Fishing » avant d'appuyer sur F.
     if restocker is not None:
         restocker.start_fishing_if_shown()
+        # Toujours sur le panneau (Start Fishing sans effet : pas d'appât équipé,
+        # même si la case vide n'a pas été reconnue) : F n'y fait rien, on passe
+        # par le réapprovisionnement, entièrement à la souris.
+        if restocker.panel_open():
+            log.warning("Panneau « Fishing Preparations » toujours ouvert : appât à équiper.")
+            restock_or_stop(cfg, restocker if may_restock else None)
+            return CycleRecord(number, "restock")
 
     # Étape 1 : lancement
     log.info("Étape 1 : appui sur %s", cfg.key_action.upper())
@@ -2152,7 +2229,7 @@ def configure_ui_scale(cfg: Config) -> None:
                         "Relancez avec la résolution du jeu, ex. : .\\start.bat -r %dx%d",
                         window[0], window[1], window[0], window[1])
         return
-    saved = cfg.ui_scale if cfg.ui_scale_size and tuple(cfg.ui_scale_size) == size else None
+    saved = cfg.ui_scale_exact if cfg.ui_scale_size and tuple(cfg.ui_scale_size) == size else None
     if cfg.ui_scale_size and tuple(cfg.ui_scale_size) != size and (cfg.banner_region or cfg.gauge_region):
         # Autre résolution que la dernière fois : les zones mémorisées ne valent plus.
         cfg.banner_region = cfg.gauge_region = None
@@ -2160,7 +2237,7 @@ def configure_ui_scale(cfg: Config) -> None:
     UI.configure(size[0], size[1], saved)
 
     def remember(scale: float) -> None:
-        cfg.ui_scale, cfg.ui_scale_size = scale, size
+        cfg.ui_scale_exact, cfg.ui_scale_size = scale, size
         remember_regions(cfg)
     UI.on_lock = remember
 

@@ -187,7 +187,6 @@ class BannerOtherResolutionTest(unittest.TestCase):
         noise = np.random.default_rng(1).integers(0, 120, (1080, 1920, 3), dtype=np.uint8)
         for real in (0.66, 0.675, 0.70, 0.72, 0.75, 0.78):
             hook.UI.configure(1920, 1080)
-            hook.UI.locked = 0.75                       # verrou venu d'une autre image
             frame = noise.copy()
             banner = cv2.resize(tpl, None, fx=real, fy=real, interpolation=cv2.INTER_AREA)
             frame[700:700 + banner.shape[0], 600:600 + banner.shape[1]] = banner
@@ -198,6 +197,37 @@ class BannerOtherResolutionTest(unittest.TestCase):
             self.assertLess(abs(box[0] - 600) + abs(box[1] - 700), 6)
             self.assertGreater(detector.locate(frame)[0], 0.9)    # échelle retenue
             self.assertLess(detector.locate(noise)[0], 0.6)       # pas de fausse détection
+            self.assertAlmostEqual(hook.UI.locked, real, delta=real * 0.008)  # pour les autres
+
+    def test_every_image_finds_its_scale_on_real_captures(self):
+        """Toutes les images (bannières, boutons, icône) sur de vraies captures
+        2560×1600 réduites comme sur un écran 1920×1080 (échelle exacte inconnue)."""
+        root = TEMPLATE.parent
+        cases = [  # (image, capture, seuil, contours)
+            ("equip_bait_banner.png", "equip bait.png", 0.8, False),
+            ("restock/bait_slot_empty.png", "fishing preparations.jpg", 0.88, False),
+            ("restock/start_fishing.png", "fishing preparations.jpg", 0.8, False),
+            ("restock/switch.png", "switch bait stock.jpg", 0.8, False),
+            ("restock/cancel.png", "switch bait stock.jpg", 0.8, False),
+            ("restock/rewards_close.png", "rewards small purchase.jpg", 0.8, False),
+            ("restock/quick_submit.png", "quick submit.png", 0.8, False),
+            ("restock/purchase.png", "purchase.png", 0.8, False),
+        ]
+        for tpl_name, capture, threshold, edges in cases:
+            image = cv2.imread(str(root / "originals" / capture))
+            if image is None:
+                continue
+            reference = BannerDetector(root / tpl_name, threshold, (1.0,), edges=edges)
+            hook.UI.configure(2560, 1600)
+            _, (x, y, _, _) = reference.locate(image)
+            for real in (0.66, 0.70, 0.75):
+                with self.subTest(image=tpl_name, scale=real):
+                    hook.UI.configure(1920, 1080)
+                    frame = cv2.resize(image, None, fx=real, fy=real, interpolation=cv2.INTER_AREA)
+                    detector = BannerDetector(root / tpl_name, threshold, (1.0,), edges=edges)
+                    score, box = detector.locate(frame)
+                    self.assertGreaterEqual(score, threshold)
+                    self.assertLess(abs(box[0] - x * real) + abs(box[1] - y * real), 10)
 
 
 class ScreenCaptureTest(unittest.TestCase):

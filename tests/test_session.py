@@ -428,6 +428,7 @@ class FakeShop:
         return {
             "slot_empty": ["bait_slot_empty"], "spot": ["fishing_prompt"],
             "prep_equipped": ["start_fishing"], "start_panel": ["start_fishing"],
+            "panel_unknown": ["start_fishing"],     # panneau, case d'appât non reconnue
             "equipped": ["equipped"],
             "menu": ["quick_submit"], "submit_rewards": ["rewards_close"],
             "menu2": ["cube_tab"], "sell_tab": ["quick_sell"], "sell_confirm": ["confirm"],
@@ -498,6 +499,8 @@ class FakeShop:
                 self.screen = "start_panel"
             else:
                 self.screen = "slot_empty"
+        elif hit == "start_fishing" and s == "panel_unknown":
+            pass                                     # sans appât : sans effet
         elif hit == "start_fishing":
             self.screen = "equipped" if s == "start_panel" else "fishing_mode"
         elif hit == "purchase" and s == "dialog":
@@ -964,6 +967,17 @@ class RestockTest(unittest.TestCase):
             restocker.run()
         self.assertEqual(self.shop.keys, ["e", "esc"])
         self.assertEqual(self.shop.screen, "fishing_mode")
+
+    def test_preparations_panel_gets_no_keys(self):
+        """Cas du 08/11 (autre PC) : panneau « Fishing Preparations » ouvert, case
+        d'appât non reconnue. Là, F, E, R… ne font rien : le bot ne doit envoyer
+        aucune touche, et s'arrêter clairement s'il ne trouve pas où cliquer."""
+        self.shop.screen = "panel_unknown"
+        self.cfg.restock_step_timeout = 0.5
+        with self.assertRaises(hook.BlockedStop) as ctx:
+            self.cycle()
+        self.assertEqual(self.shop.keys, [])
+        self.assertIn("seul un clic", str(ctx.exception))
 
     def test_no_second_restock_in_a_row(self):
         self.shop.screen = "slot_empty"
