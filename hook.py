@@ -146,7 +146,7 @@ class Config:
     start_delay: Range = (0.5, 1.5)         # après le premier F
     reaction_delay: Range = (0.12, 0.30)    # entre la bannière et le second F
     action_press_duration: Range = (0.08, 0.15)  # durée d'appui sur F (lu à chaque image par le jeu)
-    press_duration: Range = (0.03, 0.20)    # durée min./max. d'une pression A/D
+    press_duration: Range = (0.03, 0.30)    # durée min./max. d'une pression A/D
     press_cooldown: Range = (0.04, 0.10)    # intervalle min. entre deux corrections
     cycle_pause: Range = (3.0, 4.5)         # fin de cycle
     startup_countdown: float = 1.0          # délai après l'arrivée du jeu au premier plan
@@ -819,23 +819,25 @@ def clip_region(left: int, top: int, right: int, bottom: int, bounds: Region) ->
 
 
 def remember_regions(cfg: Config) -> None:
-    """Mémorise les zones verrouillées pour les prochains lancements, avec la
-    position et la taille de la fenêtre du jeu à ce moment-là."""
+    """Mémorise les zones verrouillées et la vitesse de la ligne pour les
+    prochains lancements, avec la fenêtre du jeu à ce moment-là."""
     if cfg.config_path is not None:
-        if cfg.banner_region or cfg.gauge_region:
+        if cfg.banner_region or cfg.gauge_region or cfg.line_speed:
             cfg.regions_window = tuple(int(v) for v in search_region())
         save_config_file(cfg, cfg.config_path)
 
 
 def forget_stale_regions(cfg: Config) -> None:
-    """Zones mémorisées pour une autre fenêtre (autre résolution, fenêtre
-    déplacée, ou zones d'une ancienne version) : oubliées, recherche à nouveau."""
-    if not (cfg.banner_region or cfg.gauge_region):
+    """Zones et vitesse de ligne mémorisées pour une autre fenêtre (autre
+    résolution, fenêtre déplacée, ou ancienne version) : oubliées, réapprises."""
+    if not (cfg.banner_region or cfg.gauge_region or cfg.line_speed):
         return
     window = tuple(int(v) for v in search_region())
     if cfg.regions_window is None or tuple(cfg.regions_window) != window:
         cfg.banner_region = cfg.gauge_region = None
-        log.info("Fenêtre du jeu différente de celle des zones mémorisées : zones oubliées.")
+        cfg.line_speed = None
+        log.info("Fenêtre du jeu différente de la dernière fois : zones et vitesse de la "
+                 "ligne oubliées (réapprises en quelques secondes).")
 
 
 def gauge_search_region(cfg: Config) -> Region:
@@ -1262,13 +1264,17 @@ class GaugeDetector:
             #    la plus proche du centre de la zone verte.
             center = x + w / 2
             reach = w / 2 + cfg.yellow_search_factor * w
-            best = None
+            best, best_rank = None, None
             for lx, ly, lw, lh in lines:
                 overlaps = ly <= y + h + h and ly + lh >= y - h
                 line_x = lx + lw / 2
                 if overlaps and abs(line_x - center) <= reach:
-                    if best is None or abs(line_x - center) < abs(best - center):
-                        best = line_x
+                    # La vraie ligne traverse la barre : au moins aussi haute qu'une
+                    # bonne part de celle-ci. Les petits éléments jaunes voisins ne
+                    # sont retenus qu'à défaut.
+                    rank = (0 if lh >= 0.6 * h else 1, abs(line_x - center))
+                    if best_rank is None or rank < best_rank:
+                        best, best_rank = line_x, rank
             if best is None and search:
                 continue  # barre verte sans ligne jaune : probablement le décor
             yellow_x = None if best is None else int(round(best))
@@ -1301,6 +1307,11 @@ class GaugeController:
         self.velocity = 0.0                                # px/s de la zone verte
         self.line_speed = cfg.line_speed                   # px/s d'appui (appris)
         self.speed_samples = cfg.line_speed_min_samples if cfg.line_speed else 0
+        # Mesures récentes (px/s) ; la vitesse retenue est leur médiane : une mesure
+        # aberrante (ligne mal repérée sur une image) ne fausse plus tout le dosage.
+        self._speeds: List[float] = [cfg.line_speed] if cfg.line_speed else []
+        self._last_press: Optional[Tuple[str, float]] = None  # (touche, écart avant)
+        self._stuck = 0                                    # appuis sans rapprochement
         self.presses: Dict[str, int] = {cfg.key_left: 0, cfg.key_right: 0}
         self.inverted_now = False                          # inversion faite pendant ce suivi
         # Appui en attente de mesure : (sens attendu ±1, durée, x avant, fin de l'appui)
@@ -1324,18 +1335,21 @@ class GaugeController:
             return
         expected, duration, x_before, _ = self._pending
         self._pending = None
+        if duration <= 0:
+            return
         delta = state.yellow_x - x_before
-        if abs(delta) < 3 or duration <= 0:
-            return  # mouvement trop faible pour conclure
+        width = max(1, state.green_right - state.green_left)
+        if abs(delta) < 3:
+            # Presque aucun mouvement : la ligne est plus lente que prévu. Cette
+            # mesure compte aussi (avant, elle était ignorée et une vitesse
+            # surestimée ne se corrigeait jamais : appuis trop courts pour toujours).
+            if duration >= 0.04:
+                self._add_speed(max(abs(delta), 0.5) / duration, width)
+            return
         same_direction = (delta > 0) == (expected > 0)
         self._directions = (self._directions + [same_direction])[-6:]
         if same_direction:
-            sample = abs(delta) / duration
-            if self.line_speed is None:
-                self.line_speed = sample
-            else:
-                self.line_speed = 0.7 * self.line_speed + 0.3 * sample
-            self.speed_samples += 1
+            self._add_speed(abs(delta) / duration, width)
         elif self.cfg.auto_invert and len(self._directions) >= 5 \
                 and self._directions.count(False) >= 4:
             self.cfg.invert_controls = not self.cfg.invert_controls
@@ -1343,6 +1357,13 @@ class GaugeController:
             self._directions.clear()
             log.warning("La ligne jaune part à l'opposé des appuis : Q et D inversés "
                         "automatiquement (mémorisé).")
+
+    def _add_speed(self, sample: float, width: float) -> None:
+        # Bornes plausibles : de 0,2 à 20 largeurs de zone verte par seconde d'appui.
+        sample = min(20 * width, max(0.2 * width, sample))
+        self._speeds = (self._speeds + [sample])[-7:]
+        self.line_speed = float(np.median(self._speeds))
+        self.speed_samples += 1
 
     def _direction_of(self, key: str) -> int:
         """Sens attendu du mouvement de la ligne pour cette touche (+1 = droite)."""
@@ -1393,6 +1414,16 @@ class GaugeController:
                 self._next_press_at = now + late   # réaction un peu tardive
                 return
         key, duration = decision
+        # Appuis répétés du même côté sans que l'écart diminue : la ligne va moins
+        # vite que prévu -> appuis de plus en plus longs (×1,6 à chaque fois).
+        error = abs(self.target(state) - state.yellow_x)
+        if self._last_press and self._last_press[0] == key and error > 0.85 * self._last_press[1]:
+            self._stuck += 1
+        else:
+            self._stuck = 0
+        self._last_press = (key, error)
+        if self._stuck:
+            duration = min(self.cfg.press_duration[1], duration * 1.6 ** self._stuck)
         log.debug("%s %.0f ms (jaune=%s, vert=[%d,%d], cible=%.0f, vitesse=%.0f px/s, "
                   "ligne=%s px/s)", key.upper(), duration * 1000, state.yellow_x,
                   state.green_left, state.green_right, self.target(state), self.velocity,

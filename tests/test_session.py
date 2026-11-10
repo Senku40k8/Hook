@@ -196,6 +196,42 @@ class ControllerLearningTest(unittest.TestCase):
         self.assertTrue(self.ctrl.inverted_now)
         self.assertEqual(self.ctrl.decide(state(100))[0], "a")
 
+    def test_overestimated_speed_recovers(self):
+        """Cas du 09/11 (autre PC) : vitesse mémorisée très surestimée -> appuis
+        minuscules, la ligne bouge à peine (< 3 px) et ne suit pas. Ces petits
+        mouvements comptent désormais : la vitesse redescend en 2 appuis."""
+        self.cfg.line_speed = 5000.0                        # aberrant (largeur verte 100 px)
+        self.ctrl = hook.GaugeController(self.cfg)
+        self.assertLess(self.ctrl.decide(state(100))[1], 0.04)   # appui minuscule
+        self.press(+1, 0.05, 100, 101, 0)                   # 1 px : quasiment rien
+        self.press(+1, 0.05, 101, 102, 1)
+        self.assertLess(self.ctrl.line_speed, 100)
+        self.assertGreater(self.ctrl.decide(state(100))[1], 0.15)
+
+    def test_presses_lengthen_when_line_does_not_get_closer(self):
+        saved_tap, hook.tap = hook.tap, lambda key, rng: None
+        try:
+            self.cfg.press_cooldown = (0.0, 0.0)
+            self.cfg.line_speed = 1000.0                    # premier appui court (80 ms)
+            self.ctrl = hook.GaugeController(self.cfg)
+            durations = []
+            for _ in range(4):                              # la ligne reste à 100
+                self.ctrl._next_press_at = 0
+                self.ctrl.step(state(100))
+                durations.append(self.ctrl._pending[1])
+        finally:
+            hook.tap = saved_tap
+        self.assertGreater(durations[2], durations[0] * 1.5)
+        self.assertLessEqual(max(durations), self.cfg.press_duration[1])
+
+    def test_line_crossing_the_bar_preferred_to_small_yellow_item(self):
+        img = np.full((120, 600, 3), 20, np.uint8)
+        cv2.rectangle(img, (250, 50), (350, 66), GREEN_BGR, -1)
+        cv2.rectangle(img, (296, 50), (305, 58), YELLOW_BGR, -1)     # petit élément jaune, au centre
+        cv2.rectangle(img, (219, 40), (221, 76), YELLOW_BGR, -1)     # la vraie ligne, qui traverse
+        found = hook.GaugeDetector(hook.Config()).detect(img)
+        self.assertAlmostEqual(found.yellow_x, 220, delta=2)
+
     def test_learned_speed_is_remembered(self):
         for i in range(3):
             self.press(+1, 0.1, 100, 140, i)
