@@ -176,8 +176,8 @@ class FakeNTE:
             elif m == "caught":
                 self.fish += 1
                 self.mode = "fishing"
-        elif key in ("q", "d") and m == "gauge":
-            self.yellow += (-1 if key == "q" else 1) * 0.015 * self.W
+        elif key in ("a", "d") and m == "gauge":              # « Pull Left A / Right D »
+            self.yellow += (-1 if key == "a" else 1) * 0.015 * self.W
         elif key == "e" and m in ("fishing", "equip_banner"):
             self.origin, self.mode = "fishing", "dialog"
         elif key == "q" and m in ("fishing", "equip_banner"):

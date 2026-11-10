@@ -108,14 +108,14 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(self.decide(100)[0], "d")
 
     def test_right_of_zone_presses_left(self):
-        self.assertEqual(self.decide(300)[0], "q")
+        self.assertEqual(self.decide(300)[0], "a")
 
     def test_centered_no_press(self):
         self.assertIsNone(self.decide(200))
 
     def test_inside_zone_but_off_center_corrects(self):
         """La ligne suit le centre de la zone, pas seulement ses bords."""
-        self.assertEqual(self.decide(240)[0], "q")
+        self.assertEqual(self.decide(240)[0], "a")
         self.assertEqual(self.decide(160)[0], "d")
 
     def test_longer_press_when_further(self):
@@ -127,7 +127,7 @@ class ControllerTest(unittest.TestCase):
 
     def test_invert(self):
         self.cfg.invert_controls = True
-        self.assertEqual(self.decide(100)[0], "q")
+        self.assertEqual(self.decide(100)[0], "a")
 
     def test_anticipates_moving_green_zone(self):
         """Zone verte qui part vers la droite : la ligne au centre doit déjà
@@ -268,7 +268,7 @@ class SetupHelpersTest(unittest.TestCase):
         cfg = Config()
         cfg.gauge_region = (1, 2, 3, 4)
         cfg.green_lower = (50, 60, 70)
-        cfg.invert_controls = True
+        cfg.invert_controls = True          # non mémorisé : réappris à chaque séance
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cfg.json"
             save_config_file(cfg, path)
@@ -277,7 +277,7 @@ class SetupHelpersTest(unittest.TestCase):
         self.assertEqual(loaded.gauge_region, (1, 2, 3, 4))
         self.assertEqual(loaded.green_lower, (50, 60, 70))
         self.assertIsNone(loaded.banner_region)
-        self.assertTrue(loaded.invert_controls)
+        self.assertFalse(loaded.invert_controls)
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows uniquement")
@@ -306,6 +306,15 @@ class ScancodeKeyboardTest(unittest.TestCase):
         codes = {k: kb.scancode(k) for k in "fqd"}
         self.assertTrue(all(codes.values()))
         self.assertEqual(len(set(codes.values())), 3)
+
+    def test_game_keys_ignore_windows_layout(self):
+        """Cas du 09/11 : le jeu affiche « Pull Left A » et « Q » pour le marchand,
+        par position QWERTY. Mêmes scancodes en AZERTY comme en QWERTY : A = touche
+        à droite de Tab (0x1E), Q = touche au-dessus (0x10), jamais confondues."""
+        kb = hook.ScancodeKeyboard()
+        expected = {"a": 0x1E, "d": 0x20, "q": 0x10, "e": 0x12, "f": 0x21, "r": 0x13, "esc": 0x01}
+        self.assertEqual({k: kb.scancode(k) for k in expected}, expected)
+        self.assertEqual(hook.Config().key_left, "a")
 
 
 if __name__ == "__main__":

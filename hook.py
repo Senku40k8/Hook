@@ -6,7 +6,7 @@ Cycle exécuté en boucle :
     2. Surveillance de l'écran jusqu'à l'apparition de la bannière
        "Fish on the hook! Press the button to reel it!", puis nouvel appui sur F.
     3. Suivi en temps réel de la jauge (zone verte + indicateur jaune) :
-       pressions courtes sur Q (gauche) / D (droite) pour garder l'indicateur
+       pressions courtes sur A (gauche) / D (droite), noms du jeu pour garder l'indicateur
        dans la zone verte, jusqu'à la disparition de la jauge.
     4. Jauge disparue : résultat (réussite/échec) lu si possible, appui sur F.
     5. Pause (au moins 3 s, parfois plus longue) puis retour à l'étape 1.
@@ -75,10 +75,14 @@ TEMPLATES_DIR = Path(__file__).with_name("templates")
 @dataclass
 class Config:
     # --- Touches -----------------------------------------------------------
+    # Nommées comme le jeu les affiche (« Pull Left A », « Pull Right D », « Q »
+    # pour le marchand…). Le jeu lit la position physique des touches, celle d'un
+    # clavier QWERTY : « a » est donc la touche marquée Q sur un clavier AZERTY.
+    # Le bot envoie la bonne touche quelle que soit la disposition de Windows.
     key_action: str = "f"
-    key_left: str = "q"
+    key_left: str = "a"
     key_right: str = "d"
-    # Mettre à True si Q/D font bouger l'indicateur dans le sens opposé.
+    # Mettre à True si A/D font bouger l'indicateur dans le sens opposé.
     invert_controls: bool = False
     # "scancode" (SendInput, recommandé pour les jeux), "pyautogui" ou "auto".
     input_backend: str = "auto"
@@ -132,13 +136,13 @@ class Config:
     line_speed: Optional[float] = None
     line_speed_min_samples: int = 3         # mesures avant d'utiliser la vitesse apprise
     correction_fraction: float = 0.8        # part de l'écart corrigée par un appui
-    auto_invert: bool = True                # inverse Q/D si la ligne part à l'opposé
+    auto_invert: bool = True                # inverse A/D si la ligne part à l'opposé
 
     # --- Temporisations (secondes, bornes min/max des tirages aléatoires) ---
     start_delay: Range = (0.5, 1.5)         # après le premier F
     reaction_delay: Range = (0.12, 0.30)    # entre la bannière et le second F
     action_press_duration: Range = (0.08, 0.15)  # durée d'appui sur F (lu à chaque image par le jeu)
-    press_duration: Range = (0.03, 0.20)    # durée min./max. d'une pression Q/D
+    press_duration: Range = (0.03, 0.20)    # durée min./max. d'une pression A/D
     press_cooldown: Range = (0.04, 0.10)    # intervalle min. entre deux corrections
     cycle_pause: Range = (3.0, 4.5)         # fin de cycle
     startup_countdown: float = 1.0          # délai après l'arrivée du jeu au premier plan
@@ -191,7 +195,7 @@ class Config:
 PERSISTED_FIELDS = (
     "banner_region", "gauge_region",
     "green_lower", "green_upper", "yellow_lower", "yellow_upper",
-    "invert_controls", "input_backend", "window_title", "line_speed",
+    "input_backend", "window_title", "line_speed",
     "ui_scale_exact", "ui_scale_size",
 )
 
@@ -368,6 +372,29 @@ def rand(bounds: Range) -> float:
 # --------------------------------------------------------------------------- #
 # Entrées clavier
 # --------------------------------------------------------------------------- #
+# Scancodes (jeu 1) des touches, par position sur un clavier QWERTY : c'est ainsi
+# que le jeu nomme ses touches, quelle que soit la disposition de Windows.
+GAME_SCANCODES = {
+    **{c: 0x10 + i for i, c in enumerate("qwertyuiop")},
+    **{c: 0x1E + i for i, c in enumerate("asdfghjkl")},
+    **{c: 0x2C + i for i, c in enumerate("zxcvbnm")},
+    **{c: 0x02 + i for i, c in enumerate("123456789")}, "0": 0x0B,
+    "esc": 0x01, "escape": 0x01, "enter": 0x1C, "space": 0x39, "tab": 0x0F,
+}
+
+
+def layout_char(key: str) -> str:
+    """Caractère de la disposition Windows active pour la touche du jeu `key`
+    (ex. "a" -> "q" en AZERTY). Sert au mode PyAutoGUI (touches virtuelles)."""
+    code = GAME_SCANCODES.get(key.lower())
+    if sys.platform != "win32" or code is None or len(key) != 1:
+        return key
+    u32 = ctypes.WinDLL("user32")
+    vk = u32.MapVirtualKeyW(code, 1)            # MAPVK_VSC_TO_VK
+    ch = u32.MapVirtualKeyW(vk, 2) & 0xFFFF      # MAPVK_VK_TO_CHAR
+    return chr(ch).lower() if ch else key
+
+
 class PyAutoGuiKeyboard:
     """Touches virtuelles via PyAutoGUI (suffisant pour les applis classiques)."""
 
@@ -377,10 +404,10 @@ class PyAutoGuiKeyboard:
         pass
 
     def down(self, key: str) -> None:
-        pyautogui.keyDown(key)
+        pyautogui.keyDown(layout_char(key))
 
     def up(self, key: str) -> None:
-        pyautogui.keyUp(key)
+        pyautogui.keyUp(layout_char(key))
 
 
 if sys.platform == "win32":
@@ -414,50 +441,37 @@ class ScancodeKeyboard:
     """Touches matérielles via SendInput + scancodes (Windows).
 
     Les jeux (DirectInput / Raw Input) ignorent souvent les touches virtuelles
-    de PyAutoGUI ; les scancodes sont reçus comme un vrai clavier. Le scancode
-    est calculé avec la disposition clavier active : "q" désigne donc bien la
-    touche marquée Q, en AZERTY comme en QWERTY.
+    de PyAutoGUI ; les scancodes sont reçus comme un vrai clavier. Le jeu lit
+    la position physique des touches et l'affiche comme sur un clavier QWERTY :
+    "a" (« Pull Left A ») est la touche à droite de Tab, quelle que soit la
+    disposition de Windows (marquée Q en AZERTY). Table fixe, donc.
     """
 
     name = "scancode"
     _INPUT_KEYBOARD = 1
     _KEYEVENTF_KEYUP = 0x0002
     _KEYEVENTF_SCANCODE = 0x0008
-    _MAPVK_VK_TO_VSC = 0
 
     def __init__(self) -> None:
         if sys.platform != "win32":
             raise OSError("Le mode scancode n'est disponible que sous Windows.")
         u32 = ctypes.WinDLL("user32", use_last_error=True)
-        u32.VkKeyScanW.argtypes = [wintypes.WCHAR]
-        u32.VkKeyScanW.restype = ctypes.c_short
         u32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
         u32.MapVirtualKeyW.restype = wintypes.UINT
         u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
         u32.SendInput.restype = wintypes.UINT
         self._u32 = u32
-        self._codes: dict[str, int] = {}
-
-    SPECIAL_SCANCODES = {"esc": 0x01, "escape": 0x01, "enter": 0x1C, "space": 0x39}
 
     def scancode(self, key: str) -> int:
-        if key in self.SPECIAL_SCANCODES:
-            return self.SPECIAL_SCANCODES[key]
-        if key not in self._codes:
-            if len(key) != 1:
-                raise ValueError(f"Touche non gérée en mode scancode : {key!r}")
-            vk = self._u32.VkKeyScanW(key)
-            if vk == -1:
-                raise ValueError(f"Touche absente de la disposition clavier : {key!r}")
-            sc = self._u32.MapVirtualKeyW(vk & 0xFF, self._MAPVK_VK_TO_VSC)
-            if sc == 0:
-                raise ValueError(f"Pas de scancode pour la touche {key!r}")
-            self._codes[key] = sc
-        return self._codes[key]
+        code = GAME_SCANCODES.get(key.lower())
+        if code is None:
+            raise ValueError(f"Touche non gérée en mode scancode : {key!r}")
+        return code
 
     def prepare(self, keys: Sequence[str]) -> None:
         for key in keys:
-            log.debug("Touche %s -> scancode 0x%02X", key.upper(), self.scancode(key))
+            log.debug("Touche %s du jeu -> scancode 0x%02X (touche %s de ce clavier)",
+                      key.upper(), self.scancode(key), layout_char(key).upper())
 
     def _send(self, key: str, flags: int) -> None:
         inp = _INPUT(type=self._INPUT_KEYBOARD)
@@ -1236,7 +1250,7 @@ class GaugeController:
       longue que l'écart est grand (à-coups courts quand on est proche).
     - Réglage automatique : après chaque appui, le déplacement réel de la ligne
       donne sa vitesse (px par seconde d'appui), qui sert ensuite à doser les
-      appuis. Si la ligne part systématiquement à l'opposé, Q et D sont inversés.
+      appuis. Si la ligne part systématiquement à l'opposé, A et D sont inversés.
     - Comportement humain (facultatif) : corrections parfois un peu en retard,
       appuis parfois un peu trop longs.
     """
@@ -1518,7 +1532,7 @@ def track_gauge(cfg: Config, detector: GaugeDetector) -> TrackResult:
 
 
 def learn_from(cfg: Config, controller: GaugeController) -> None:
-    """Mémorise la vitesse de ligne apprise (et une éventuelle inversion Q/D)."""
+    """Mémorise la vitesse de ligne apprise (et une éventuelle inversion A/D)."""
     changed = controller.inverted_now
     if controller.line_speed and controller.speed_samples >= cfg.line_speed_min_samples:
         if cfg.line_speed is None or abs(controller.line_speed - cfg.line_speed) > 1:
@@ -2160,7 +2174,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="pas de pauses de 5-15 min entre les sessions de jeu")
     p.add_argument("--robotic", action="store_true",
                    help="désactive le comportement humain (délais uniformes, sans imperfections)")
-    p.add_argument("--invert", action="store_true", help="inverse Q et D")
+    p.add_argument("--invert", action="store_true", help="inverse A et D")
     p.add_argument("--input", choices=("auto", "scancode", "pyautogui"),
                    help="méthode d'envoi des touches (auto = scancode sous Windows)")
     p.add_argument("-v", "--verbose", action="store_true", help="logs détaillés")
@@ -2371,7 +2385,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
 
         keyboard = make_keyboard(cfg.input_backend)
-        keyboard.prepare((cfg.key_action, cfg.key_left, cfg.key_right, cfg.bait_menu_key, "esc"))
+        keyboard.prepare((cfg.key_action, cfg.key_left, cfg.key_right, cfg.bait_menu_key, "q", "esc"))
         log.info("Envoi des touches : %s", keyboard.name)
 
         banner = BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)

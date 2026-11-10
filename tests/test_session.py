@@ -193,7 +193,7 @@ class ControllerLearningTest(unittest.TestCase):
             self.press(+1, 0.1, 150, 120, i)                # attendu à droite, part à gauche
         self.assertTrue(self.cfg.invert_controls)
         self.assertTrue(self.ctrl.inverted_now)
-        self.assertEqual(self.ctrl.decide(state(100))[0], "q")
+        self.assertEqual(self.ctrl.decide(state(100))[0], "a")
 
     def test_learned_speed_is_remembered(self):
         for i in range(3):
@@ -245,7 +245,7 @@ class FakeGame:
             self.grabs = 0
         elif key == "d":
             self.yellow += 30
-        elif key == "q":
+        elif key == "a":
             self.yellow -= 30
 
     def up(self, key):

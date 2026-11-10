@@ -57,8 +57,10 @@ lui-même au premier plan.
 >   Le bot adapte alors la taille des images. Il retient l'échelle exacte dès qu'il
 >   reconnaît un élément avec certitude, et la mémorise. Si la fenêtre du jeu n'a pas la
 >   taille attendue, le bot affiche au démarrage la commande `-r` à utiliser.
-> - **Clavier AZERTY.** Le bot tire à gauche avec la touche Q d'un clavier AZERTY. Sur un
->   clavier QWERTY, le jeu attend probablement A.
+> - **Clavier : n'importe lequel.** Le jeu nomme ses touches selon leur position sur un
+>   clavier QWERTY (« Pull Left **A** », « **Q** » pour le marchand). Le bot envoie ces
+>   positions-là, que Windows soit en AZERTY ou en QWERTY. En AZERTY, « A » du jeu est la
+>   touche marquée Q, et « Q » du jeu la touche marquée A.
 > - **Jeu en anglais.** Le bot reconnaît les textes « Purchase », « Switch », « Confirm »…
 
 Les options du bot se placent après la commande, par exemple
@@ -77,7 +79,7 @@ Boucle automatisée en Python (PyAutoGUI + OpenCV) :
 1. appui sur `F`, puis latence aléatoire de 0.5 s à 1.5 s ;
 2. attente de la bannière « Fish on the hook! Press the button to reel it! », puis nouvel appui sur `F` ;
 3. suivi de la jauge : la zone verte se déplace à gauche et à droite, et la ligne jaune est
-   maintenue sur elle par des à-coups sur `Q` (gauche) et `D` (droite), jusqu'à ce que la
+   maintenue sur elle par des à-coups sur `A` (gauche) et `D` (droite), touches du jeu, jusqu'à ce que la
    jauge disparaisse ;
 4. appui sur `F` une fois la jauge disparue (le résultat est lu s'il est reconnaissable) ;
 5. pause d'au moins 3 s, puis retour à l'étape 1.
@@ -87,10 +89,10 @@ se déplace. Les appuis sont d'autant plus longs que l'écart est grand. Seules 
 jaunes fines et verticales sont prises pour la ligne : une icône jaune à côté de la jauge ne
 fausse pas la mesure.
 
-**Réglage automatique** : après chaque appui sur Q ou D, le bot mesure de combien la ligne a
+**Réglage automatique** : après chaque appui sur A ou D, le bot mesure de combien la ligne a
 réellement bougé. Il en déduit la vitesse de la ligne et dose ensuite ses appuis en
 conséquence. Cette vitesse est mémorisée d'une partie à l'autre. Si la ligne part
-systématiquement à l'opposé de l'appui, Q et D sont inversés automatiquement.
+systématiquement à l'opposé de l'appui, A et D sont inversés automatiquement (pour la séance en cours).
 
 ## Comportement humain et sessions
 
@@ -128,7 +130,7 @@ Le bot ouvre d'abord la fenêtre **Switch Bait** et regarde ce qu'elle propose :
 Vente (depuis le mode pêche seulement) :
 
 1. clic sur **Cancel** pour fermer « Switch Bait » ;
-2. `Q`, clic sur **Quick Submit** (et fermeture de « Rewards » si elle apparaît) ;
+2. `Q` du jeu (touche marquée A en AZERTY), clic sur **Quick Submit** (et fermeture de « Rewards » si elle apparaît) ;
 3. clic sur l'**onglet au cube**, puis sur **Quick Sell**, puis sur **Confirm** et
    fermeture de « Rewards » si elles apparaissent ;
 4. `Échap` pour revenir au mode pêche, puis réouverture de « Switch Bait ».
@@ -213,7 +215,7 @@ ignorés pendant le choix. Le bot ne travaille ensuite que dans cette fenêtre :
 .\start.bat --list-windows           # titres des fenêtres ouvertes
 .\start.bat --window "Nom du jeu"    # cible la fenêtre par son titre (et le mémorise)
 .\start.bat --cycles 10 -v           # 10 cycles, logs détaillés
-.\start.bat --invert                 # si Q/D agissent dans le sens opposé
+.\start.bat --invert                 # si A/D agissent dans le sens opposé
 .\start.bat --input pyautogui        # touches via PyAutoGUI au lieu des scancodes
 .\start.bat --reset                  # oublie les zones mémorisées
 ```
@@ -254,9 +256,9 @@ Pour vérifier, gardez la jauge à l'écran et lancez `.\start.bat --calibrate`.
 ### Envoi des touches
 
 Sous Windows, les touches sont envoyées par défaut comme un vrai clavier (`SendInput` +
-scancodes), car beaucoup de jeux ignorent les touches virtuelles de PyAutoGUI. Le scancode
-est calculé selon la disposition clavier active : `q` correspond bien à la touche marquée Q,
-en AZERTY comme en QWERTY. Les options en ligne de commande (`--gauge-region`,
+scancodes), car beaucoup de jeux ignorent les touches virtuelles de PyAutoGUI. Les touches
+sont nommées comme dans le jeu, par position QWERTY, et envoyées à cette position quelle que
+soit la disposition de Windows (le journal indique la touche correspondante du clavier). Les options en ligne de commande (`--gauge-region`,
 `--banner-region`, `--invert`, `--input`) priment sur `hook_config.json`.
 
 ## Arrêt
