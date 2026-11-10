@@ -23,13 +23,14 @@ def setUpModule():
     dans un coin) : un appui pendant les tests, ou le bot lancé en parallèle,
     ne doit pas les interrompre. PauseKeyTest remplace _key_state à sa façon."""
     global _saved_inputs
-    _saved_inputs = (hook._key_state, hook._visible_cursor_in_corner)
+    _saved_inputs = (hook._key_state, hook._visible_cursor_in_corner, hook.layout_char)
     hook._key_state = lambda vk: 0
     hook._visible_cursor_in_corner = lambda: False
+    hook.layout_char = lambda k: k          # clavier QWERTY, quel que soit le PC
 
 
 def tearDownModule():
-    hook._key_state, hook._visible_cursor_in_corner = _saved_inputs
+    hook._key_state, hook._visible_cursor_in_corner, hook.layout_char = _saved_inputs
 
 
 from session import (  # noqa: E402
@@ -410,6 +411,7 @@ class FakeShop:
         self.stock, self.shells, self.sell_gives = stock, shells, sell_gives
         self.equip_works = True
         self.confirm_on_buy = True             # False : petit achat, « Rewards » direct
+        self.menu_key = "q"                    # touche qui ouvre le menu du marchand
         self.ghost_purchase = False            # 1er Purchase visible derrière la boutique
         self.ghost_box = None
         self.keys, self.clicks, self.events = [], [], []
@@ -454,7 +456,7 @@ class FakeShop:
         elif key == "e" and s in ("fishing_mode", "equip_banner"):
             self.origin = "fishing_mode"
             self.screen = "dialog"
-        elif key == "q" and s in ("fishing_mode", "equip_banner"):
+        elif key == self.menu_key and s in ("fishing_mode", "equip_banner"):
             # Q (vente) ne marche qu'en mode pêche, pas sur le panneau de
             # préparation (capture du 08/11 à 10:14).
             self.menu_origin = "fishing_mode"
@@ -967,6 +969,42 @@ class RestockTest(unittest.TestCase):
             restocker.run()
         self.assertEqual(self.shop.keys, ["e", "esc"])
         self.assertEqual(self.shop.screen, "fishing_mode")
+
+    def azerty_cycle(self):
+        saved = hook.layout_char
+        hook.layout_char = lambda k: {"a": "q", "q": "a"}.get(k, k)     # AZERTY
+        try:
+            return self.cycle()
+        finally:
+            hook.layout_char = saved
+
+    def test_menu_opens_with_the_players_key(self):
+        """En AZERTY, le joueur ouvre le menu avec la touche marquée Q (« a » du jeu,
+        position QWERTY) : essayée en premier, et retenue."""
+        self.shop.menu_key = "a"
+        record = self.azerty_cycle()
+        self.assertEqual(record.outcome, "restock")
+        self.assertEqual(self.shop.keys[:4], ["f", "e", "a", "esc"])
+        self.assertEqual(self.cfg.sell_menu_key, "a")
+
+    def test_menu_key_is_checked_and_alternative_remembered(self):
+        """Cas du 09/11 : la touche n'ouvre pas le menu du marchand. Le bot le voit
+        (pas de Quick Submit), réessaie (appui perdu ?), puis essaie l'autre
+        touche, et retient celle qui marche."""
+        self.shop.menu_key = "q"
+        record = self.azerty_cycle()
+        self.assertEqual(record.outcome, "restock")
+        self.assertEqual(self.shop.clicks, self.SELL + self.BUY + self.EQUIP)
+        self.assertEqual(self.shop.keys[:6], ["f", "e", "a", "a", "q", "esc"])
+        self.assertEqual(self.cfg.sell_menu_key, "q")
+
+    def test_menu_never_opens_stops_cleanly(self):
+        self.shop.menu_key = "x"                            # aucune touche ne marche
+        self.cfg.restock_step_timeout = 0.5
+        with self.assertRaises(hook.BlockedStop) as ctx:
+            self.cycle()
+        self.assertIn("marchand", str(ctx.exception))
+        self.assertEqual(self.shop.screen, "fishing_mode")  # toujours en mode pêche
 
     def test_preparations_panel_gets_no_keys(self):
         """Cas du 08/11 (autre PC) : panneau « Fishing Preparations » ouvert, case

@@ -173,6 +173,9 @@ class Config:
 
     restock_enabled: bool = True
     bait_menu_key: str = "e"                # ouvre la sélection d'appât (« Select Bait »)
+    # Menu du marchand (vente). None : touche marquée Q sur ce clavier d'abord
+    # (celle qu'utilise le joueur), puis « Q » du jeu ; la bonne est retenue.
+    sell_menu_key: Optional[str] = None
     restock_dir: Path = TEMPLATES_DIR / "restock"
     no_bait_template: Path = TEMPLATES_DIR / "equip_bait_banner.png"
     restock_threshold: float = 0.80         # boutons texte (niveaux de gris)
@@ -195,7 +198,7 @@ class Config:
 PERSISTED_FIELDS = (
     "banner_region", "gauge_region",
     "green_lower", "green_upper", "yellow_lower", "yellow_upper",
-    "input_backend", "window_title", "line_speed",
+    "input_backend", "window_title", "line_speed", "sell_menu_key",
     "ui_scale_exact", "ui_scale_size",
 )
 
@@ -1603,7 +1606,7 @@ BUY_STEPS: Tuple[Tuple[str, str], ...] = (
 # le mode pêche (en sortir sans appât empêche de relancer « Start Fishing »).
 SELL_STEPS: Tuple[Tuple[str, str], ...] = (
     ("click", "cancel"),                 # ferme « Switch Bait » sans quitter le mode pêche
-    ("key", "q"),                        # menu
+    ("open_menu", "quick_submit"),       # touche Q du jeu, vérifiée (voir open_menu)
     ("click", "quick_submit"),
     ("dismiss", "rewards_close"),        # fenêtre de récompense éventuelle
     ("click", "cube_tab"),               # onglet au cube
@@ -1614,7 +1617,7 @@ SELL_STEPS: Tuple[Tuple[str, str], ...] = (
     ("bait_dialog", "bait_slot_empty"),  # rouvre « Switch Bait » pour acheter
 )
 RESTOCK_BUTTONS = sorted({name for steps in (SELL_STEPS, BUY_STEPS)
-                          for action, name in steps if action != "key"}
+                          for action, name in steps if action not in ("key",)}
                          | {"bait_slot_empty"})
 # Boutons qui indiquent qu'un menu est encore ouvert (à fermer avec Échap après
 # un échec) ; le panneau « Fishing Preparations » n'en fait pas partie.
@@ -1864,12 +1867,45 @@ class Restocker:
             raise RestockFailed("appâts pas équipés (case toujours vide)")
         log.info("Appât équipé, reprise de la pêche.")
 
+    def open_menu(self, expected: str) -> None:
+        """Ouvre le menu du marchand et vérifie qu'il s'est ouvert (bouton
+        `expected` visible). Essais : la touche qui a déjà marché, sinon la touche
+        marquée Q sur ce clavier (celle du joueur en AZERTY), deux fois (un appui
+        peut se perdre pendant la fermeture d'une fenêtre), puis « Q » du jeu
+        (position QWERTY). La touche qui ouvre le menu est retenue."""
+        local_q = next((k for k in "abcdefghijklmnopqrstuvwxyz" if layout_char(k) == "q"), "q")
+        first = self.cfg.sell_menu_key or local_q
+        keys = [first, first] + [k for k in (local_q, "q") if k != first]
+        keys = [k for i, k in enumerate(keys) if k not in keys[:i] or i == 1]
+        sleep(human.within((0.9, 1.4)))              # fin de fermeture de la fenêtre
+        for attempt, key in enumerate(keys, 1):
+            log.info("  touche %s du jeu (menu du marchand)%s", key.upper(),
+                     f", essai {attempt}" if attempt > 1 else "")
+            tap(key, self.cfg.action_press_duration)
+            try:
+                self.wait_for_button(expected, timeout=3.0, quiet=True)
+            except RestockFailed:
+                continue
+            if key != self.cfg.sell_menu_key:
+                log.info("  le menu s'ouvre avec la touche %s du jeu (touche %s de ce "
+                         "clavier) : retenue.", key.upper(), layout_char(key).upper())
+                self.cfg.sell_menu_key = key
+                remember_regions(self.cfg)
+            return
+        self._save_failure(expected, grab(search_region()), self.buttons[expected],
+                           "Le menu du marchand ne s'ouvre pas (touches essayées : "
+                           + ", ".join(k.upper() for k in keys) + ").")
+        raise RestockFailed("menu du marchand impossible à ouvrir")
+
     def _run_steps(self, steps: Sequence[Tuple[str, str]]) -> None:
         """Exécute une liste d'étapes (voir EQUIP_STEPS et BUY_STEPS)."""
         clicked: Dict[str, List[Region]] = {}
         for action, value in steps:
             # Rythme humain : courte pause, parfois une hésitation.
             sleep(human.within(self.cfg.restock_step_delay) + human.hesitation())
+            if action == "open_menu":
+                self.open_menu(value)
+                continue
             if action == "key":
                 log.info("  touche %s", value.upper())
                 tap(value, self.cfg.action_press_duration)

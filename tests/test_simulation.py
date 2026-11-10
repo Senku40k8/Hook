@@ -258,6 +258,8 @@ class SimulationTest(unittest.TestCase):
         self.saved = (hook.grab, hook.keyboard, hook.human, hook.target, hook.click_box,
                       hook.UI.candidates, hook.UI.locked, hook.UI.on_lock,
                       hook._key_state, hook._visible_cursor_in_corner)
+        self.saved_layout = hook.layout_char
+        hook.layout_char = lambda k: k      # clavier QWERTY, quel que soit le PC
         # Indépendant du vrai clavier et de la vraie souris : Échap, F8 ou la souris
         # dans un coin pendant les tests (ou le bot lancé en parallèle) ne doivent
         # pas interrompre la simulation.
@@ -268,6 +270,7 @@ class SimulationTest(unittest.TestCase):
         (hook.grab, hook.keyboard, hook.human, hook.target, hook.click_box,
          hook.UI.candidates, hook.UI.locked, hook.UI.on_lock,
          hook._key_state, hook._visible_cursor_in_corner) = self.saved
+        hook.layout_char = self.saved_layout
 
     def run_bot(self, game, cycles):
         hook.grab = game.grab
