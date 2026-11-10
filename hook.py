@@ -92,6 +92,10 @@ class Config:
     # automatiquement à la première détection et mémorisée dans hook_config.json.
     banner_region: Optional[Region] = None
     gauge_region: Optional[Region] = None
+    regions_window: Optional[Region] = None  # fenêtre du jeu quand les zones ont été retenues
+    # La jauge est en haut de l'écran : recherche limitée à cette part de la
+    # fenêtre (évite de prendre un élément vert et jaune d'un menu pour la jauge).
+    gauge_search_top: float = 0.40
     auto_lock_regions: bool = True
     # Titre de la fenêtre du jeu : mémorisé au premier lancement, le bot la met
     # ensuite lui-même au premier plan.
@@ -196,7 +200,7 @@ class Config:
 
 # Champs enregistrés dans hook_config.json (réglages propres à la machine).
 PERSISTED_FIELDS = (
-    "banner_region", "gauge_region",
+    "banner_region", "gauge_region", "regions_window",
     "green_lower", "green_upper", "yellow_lower", "yellow_upper",
     "input_backend", "window_title", "line_speed", "sell_menu_key",
     "ui_scale_exact", "ui_scale_size",
@@ -815,9 +819,29 @@ def clip_region(left: int, top: int, right: int, bottom: int, bounds: Region) ->
 
 
 def remember_regions(cfg: Config) -> None:
-    """Mémorise les zones verrouillées pour les prochains lancements."""
+    """Mémorise les zones verrouillées pour les prochains lancements, avec la
+    position et la taille de la fenêtre du jeu à ce moment-là."""
     if cfg.config_path is not None:
+        if cfg.banner_region or cfg.gauge_region:
+            cfg.regions_window = tuple(int(v) for v in search_region())
         save_config_file(cfg, cfg.config_path)
+
+
+def forget_stale_regions(cfg: Config) -> None:
+    """Zones mémorisées pour une autre fenêtre (autre résolution, fenêtre
+    déplacée, ou zones d'une ancienne version) : oubliées, recherche à nouveau."""
+    if not (cfg.banner_region or cfg.gauge_region):
+        return
+    window = tuple(int(v) for v in search_region())
+    if cfg.regions_window is None or tuple(cfg.regions_window) != window:
+        cfg.banner_region = cfg.gauge_region = None
+        log.info("Fenêtre du jeu différente de celle des zones mémorisées : zones oubliées.")
+
+
+def gauge_search_region(cfg: Config) -> Region:
+    """Haut de la fenêtre du jeu, où se trouve la jauge."""
+    left, top, width, height = search_region()
+    return left, top, width, max(1, int(height * cfg.gauge_search_top))
 
 
 # --------------------------------------------------------------------------- #
@@ -1174,8 +1198,18 @@ class GaugeDetector:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (cfg.gauge_bridge_px, 1))
         self._denoise = np.ones((3, 3), np.uint8)
+
+    @staticmethod
+    def ui_scale() -> float:
+        """Échelle de l'interface (1.0 en 2560×1600) : les tailles en pixels des
+        réglages valent pour 2560×1600 et sont réduites d'autant ailleurs."""
+        if UI.locked:
+            return UI.locked
+        return min(UI.candidates) if UI.candidates else 1.0
+
+    def px(self, value: float, minimum: int) -> int:
+        return max(minimum, int(round(value * self.ui_scale())))
 
     def masks(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Renvoie (hsv, masque_vert, masque_jaune) — utile aussi pour la calibration."""
@@ -1183,7 +1217,8 @@ class GaugeDetector:
         green = cv2.inRange(hsv, np.array(self.cfg.green_lower), np.array(self.cfg.green_upper))
         green = cv2.morphologyEx(green, cv2.MORPH_OPEN, self._denoise)
         # La ligne jaune peut couper la zone verte en deux : on referme horizontalement.
-        green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, self._bridge)
+        bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (self.px(self.cfg.gauge_bridge_px, 5), 1))
+        green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, bridge)
         yellow = cv2.inRange(hsv, np.array(self.cfg.yellow_lower), np.array(self.cfg.yellow_upper))
         return hsv, green, yellow
 
@@ -1195,7 +1230,7 @@ class GaugeDetector:
         lines = []
         for i in range(1, count):
             x, y, w, h, area = stats[i]
-            if area >= cfg.yellow_min_pixels and h >= cfg.yellow_min_height \
+            if area >= self.px(cfg.yellow_min_pixels, 3) and h >= self.px(cfg.yellow_min_height, 3) \
                     and h >= cfg.yellow_min_aspect * w:
                 lines.append((int(x), int(y), int(w), int(h)))
         return lines
@@ -1216,7 +1251,7 @@ class GaugeDetector:
         candidates = []
         for c in contours:
             x, y, w, h = cv2.boundingRect(c)
-            if w >= cfg.gauge_min_width and h > 0 and w / h >= cfg.gauge_min_aspect:
+            if w >= self.px(cfg.gauge_min_width, 12) and h > 0 and w / h >= cfg.gauge_min_aspect:
                 candidates.append((x, y, w, h))
         candidates.sort(key=lambda b: b[2] * b[3], reverse=True)
         lines = self.yellow_lines(yellow)
@@ -1460,23 +1495,59 @@ def save_banner_miss(score: float, frame: Optional[np.ndarray]) -> None:
 
 
 def wait_for_gauge(cfg: Config, detector: GaugeDetector) -> bool:
+    """Attend la jauge. Zone mémorisée vide pendant 1.5 s : on cherche aussi dans
+    tout le haut de la fenêtre (zone périmée), et on mémorise la nouvelle."""
     log.info("Attente de la jauge…")
-    deadline = time.perf_counter() + cfg.gauge_appear_timeout
+    started = time.perf_counter()
+    deadline = started + cfg.gauge_appear_timeout
+    scans = 0
+    last_frame = None
     while time.perf_counter() < deadline:
         check_stop()
         wait_for_focus()
-        searching = cfg.gauge_region is None
-        region = cfg.gauge_region or search_region()
-        state = detector.detect(grab(region))
+        wide = cfg.gauge_region is None or (
+            time.perf_counter() - started > 1.5 and scans % 2 == 1)
+        region = gauge_search_region(cfg) if wide else cfg.gauge_region
+        frame = grab(region)
+        state = detector.detect(frame)
+        scans += 1
+        if wide:
+            last_frame = frame
         if state is not None:
             log.info("Jauge détectée, début du suivi.")
-            if searching and cfg.auto_lock_regions:
+            if wide and cfg.auto_lock_regions:
+                if cfg.gauge_region is not None:
+                    log.info("Jauge trouvée hors de la zone mémorisée : nouvelle zone.")
                 cfg.gauge_region = gauge_lock_region(cfg, state, region)
                 remember_regions(cfg)
                 log.info("Zone de la jauge mémorisée : %s", cfg.gauge_region)
             return True
         sleep(cfg.scan_interval)
+    save_gauge_miss(detector, last_frame if last_frame is not None else grab(gauge_search_region(cfg)))
     return False
+
+
+_gauge_miss_saved = False
+
+
+def save_gauge_miss(detector: GaugeDetector, frame: np.ndarray) -> None:
+    """Jauge jamais vue : garde (une fois par lancement) l'image et ce que le bot
+    y voit (vert, jaune) dans debug/, pour comprendre pourquoi."""
+    global _gauge_miss_saved
+    if _gauge_miss_saved or frame is None or frame.size == 0:
+        return
+    _gauge_miss_saved = True
+    try:
+        _, green, yellow = detector.masks(frame)
+        masks = np.zeros_like(frame)
+        masks[green > 0] = (0, 200, 0)
+        masks[yellow > 0] = (0, 230, 255)
+        out = Path("debug") / f"gauge_missed_{time.strftime('%H%M%S')}.png"
+        out.parent.mkdir(exist_ok=True)
+        cv2.imwrite(str(out), np.vstack([frame, masks]))
+        log.info("Capture de la recherche de jauge (image, puis vert et jaune vus) : %s", out)
+    except Exception as exc:                # diagnostic seulement : jamais bloquant
+        log.debug("Capture impossible : %s", exc)
 
 
 @dataclass
@@ -1488,6 +1559,9 @@ class TrackResult:
     in_zone_ratio: float                    # part des images où la ligne était dans le vert
 
 
+_first_track_done = False
+
+
 def track_gauge(cfg: Config, detector: GaugeDetector) -> TrackResult:
     """Suit la jauge jusqu'à sa disparition (absence continue > gauge_lost_grace)."""
     controller = GaugeController(cfg, human if human.cfg.enabled else None)
@@ -1496,6 +1570,20 @@ def track_gauge(cfg: Config, detector: GaugeDetector) -> TrackResult:
     frames = recorded = seen = in_zone = 0
     if cfg.record_dir is not None:
         cfg.record_dir.mkdir(parents=True, exist_ok=True)
+    # Premier suivi de chaque lancement : quelques images annotées dans
+    # debug/first_track/ (ce que le bot voit), pour comprendre un mauvais suivi.
+    global _first_track_done
+    sample_dir = None
+    if not _first_track_done and cfg.record_dir is None:
+        _first_track_done = True
+        sample_dir = Path("debug") / "first_track"
+        try:
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            for old in sample_dir.glob("*.png"):
+                old.unlink()
+        except OSError:
+            sample_dir = None
+    next_sample, samples = started, 0
 
     def result(disappeared: bool) -> TrackResult:
         learn_from(cfg, controller)
@@ -1515,6 +1603,13 @@ def track_gauge(cfg: Config, detector: GaugeDetector) -> TrackResult:
         frame = grab(cfg.gauge_region or search_region())
         state = detector.detect(frame)
         frames += 1
+        if sample_dir is not None and samples < 30 and now >= next_sample:
+            target_x = controller.target(state) if state else None
+            cv2.imwrite(str(sample_dir / f"t{now - started:05.2f}s.png"),
+                        annotate(frame, state, target_x))
+            if samples == 0:
+                log.info("Images du premier suivi de jauge : %s", sample_dir)
+            samples, next_sample = samples + 1, now + 0.25
         if cfg.record_dir is not None and recorded < cfg.record_max_frames:
             target_x = controller.target(state) if state else None
             cv2.imwrite(str(cfg.record_dir / f"track_{recorded:04d}.png"),
@@ -2437,6 +2532,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             sleep(cfg.startup_countdown)
         configure_ui_scale(cfg)
+        forget_stale_regions(cfg)
 
         if cfg.gauge_region is None or cfg.banner_region is None:
             log.info("Zones non mémorisées : recherche dans la fenêtre du jeu au premier "
