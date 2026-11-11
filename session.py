@@ -53,8 +53,8 @@ class HumanConfig:
     very_long_pause_chance: float = 0.03
     very_long_pause: Range = (10.0, 20.0)
     # Menus : hésitation occasionnelle avant une action.
-    hesitation_chance: float = 0.12
-    hesitation: Range = (0.6, 1.8)
+    hesitation_chance: float = 0.08
+    hesitation: Range = (0.4, 1.2)
 
 
 class Humanizer:

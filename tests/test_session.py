@@ -448,6 +448,7 @@ class FakeShop:
         self.equip_works = True
         self.confirm_on_buy = True             # False : petit achat, « Rewards » direct
         self.menu_key = "q"                    # touche qui ouvre le menu du marchand
+        self.extra_rewards = 0                 # « Rewards » supplémentaires après la vente
         self.ghost_purchase = False            # 1er Purchase visible derrière la boutique
         self.ghost_box = None
         self.keys, self.clicks, self.events = [], [], []
@@ -564,7 +565,9 @@ class FakeShop:
                 else:
                     self.stock = 99
                     self.screen = "buy_rewards"
-            if hit == "rewards_close":
+            if hit == "rewards_close" and s == "sell_rewards" and self.extra_rewards:
+                self.extra_rewards -= 1          # la récompense suivante s'affiche
+            elif hit == "rewards_close":
                 self.screen = {"submit_rewards": "menu2", "sell_rewards": "menu_after",
                                "buy_rewards": "shop_done"}[s]
 
@@ -1041,6 +1044,16 @@ class RestockTest(unittest.TestCase):
             self.cycle()
         self.assertIn("marchand", str(ctx.exception))
         self.assertEqual(self.shop.screen, "fishing_mode")  # toujours en mode pêche
+
+    def test_several_rewards_windows_in_a_row(self):
+        """Cas du 11/11 (autre PC) : après la vente, plusieurs « Rewards » se suivent.
+        Le bot les ferme une à une au lieu de conclure qu'elle ne se ferme pas."""
+        self.shop.extra_rewards = 4
+        record = self.cycle()
+        self.assertEqual(record.outcome, "restock")
+        sell = self.SELL[:-1] + ["rewards_close"] * 5            # 1 + 4 fenêtres
+        self.assertEqual(self.shop.clicks, sell + self.BUY + self.EQUIP)
+        self.assertEqual(self.shop.stock, 98)
 
     def test_preparations_panel_gets_no_keys(self):
         """Cas du 08/11 (autre PC) : panneau « Fishing Preparations » ouvert, case

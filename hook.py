@@ -185,7 +185,8 @@ class Config:
     restock_threshold: float = 0.80         # boutons texte (niveaux de gris)
     restock_icon_threshold: float = 0.60    # icônes (contours)
     restock_step_timeout: float = 6.0       # attente max. de chaque bouton (s)
-    restock_step_delay: Range = (0.35, 0.8) # pause humaine entre deux étapes
+    restock_step_delay: Range = (0.2, 0.5)  # pause humaine entre deux étapes
+    escape_settle: Range = (0.45, 0.75)     # avant chaque Échap : laisser finir l'animation
     # Sans templates/equip_bait_banner.png : tenter un réapprovisionnement quand la
     # bannière « Fish on the hook » n'arrive pas. Inutile tant que la case vide est
     # vérifiée avant chaque cycle.
@@ -1739,11 +1740,11 @@ SELL_STEPS: Tuple[Tuple[str, str], ...] = (
     ("click", "quick_sell"),             # vend les poissons : rapporte des coquillages
     ("optional", "confirm"),             # confirmation éventuelle
     ("dismiss", "rewards_close"),        # fenêtre de récompense éventuelle
-    ("key", "esc"),                      # retour au mode pêche
+    ("escape_menu", "esc"),              # retour au mode pêche (vérifié)
     ("bait_dialog", "bait_slot_empty"),  # rouvre « Switch Bait » pour acheter
 )
 RESTOCK_BUTTONS = sorted({name for steps in (SELL_STEPS, BUY_STEPS)
-                          for action, name in steps if action not in ("key",)}
+                          for action, name in steps if action not in ("key", "escape_menu")}
                          | {"bait_slot_empty"})
 # Boutons qui indiquent qu'un menu est encore ouvert (à fermer avec Échap après
 # un échec) ; le panneau « Fishing Preparations » n'en fait pas partie.
@@ -1866,18 +1867,48 @@ class Restocker:
         except RestockFailed:
             log.debug("  pas de fenêtre « Rewards » à fermer")
             return
-        x, y, w, h = hint
-        empty_area = (x + w // 6, int(y - 2.6 * h), w * 2 // 3, int(1.4 * h))
-        for _ in range(3):                      # au plus 3 essais
+        detector = self.buttons[name]
+        # Plusieurs « Rewards » peuvent se suivre (une par récompense) : on les
+        # ferme une à une. Une fenêtre qui disparaît puis réapparaît est la
+        # suivante, pas un échec ; on ne s'arrête qu'après 8 clics sans fin.
+        for attempt in range(8):
+            x, y, w, h = hint
+            empty_area = (x + w // 6, int(y - 2.6 * h), w * 2 // 3, int(1.4 * h))
             sleep(human.reaction())
-            log.info("  clic dans une zone vide (fermeture de « Rewards »)")
+            log.info("  clic dans une zone vide (fermeture de « Rewards »)%s",
+                     f", fenêtre {attempt + 1}" if attempt else "")
             click_box(empty_area)
-            deadline = time.perf_counter() + 2.0
+            deadline = time.perf_counter() + 2.5
+            gone = False
             while time.perf_counter() < deadline:
                 sleep(0.15)
-                if not self.buttons[name].detect(grab(search_region())):
-                    return
+                if not detector.detect(grab(search_region())):
+                    gone = True
+                    break
+            if gone:
+                sleep(human.within((0.5, 0.8)))     # une autre « Rewards » arrive-t-elle ?
+            region = search_region()
+            score, box = detector.locate(grab(region))
+            if box is None or score < detector.threshold:
+                return
+            if gone:
+                log.info("  nouvelle fenêtre « Rewards »")
+            hint = (region[0] + box[0], region[1] + box[1], box[2], box[3])
+        self._save_failure(name, grab(search_region()), detector,
+                           "La fenêtre « Rewards » reste affichée après 8 clics.")
         raise RestockFailed("la fenêtre « Rewards » ne se ferme pas")
+
+    def escape_menu(self) -> None:
+        """Échap pour quitter le menu du marchand, vérifié : si le menu est encore
+        là (appui perdu pendant une animation), un second Échap, au plus. Jamais
+        d'Échap sans menu visible : il ferait quitter le mode pêche."""
+        for attempt in range(2):
+            sleep(human.within(self.cfg.escape_settle))
+            log.info("  touche ESC%s", " (le menu est encore ouvert)" if attempt else "")
+            tap("esc", self.cfg.action_press_duration)
+            sleep(human.within((0.7, 1.0)))
+            if not self.menu_open():
+                return
 
     def wait_for_button(self, name: str, timeout: Optional[float] = None,
                         avoid: Sequence[Region] = (), quiet: bool = False) -> Region:
@@ -2032,7 +2063,12 @@ class Restocker:
             if action == "open_menu":
                 self.open_menu(value)
                 continue
+            if action == "escape_menu":
+                self.escape_menu()
+                continue
             if action == "key":
+                if value == "esc":                      # pas trop tôt : sinon ignoré
+                    sleep(human.within(self.cfg.escape_settle))
                 log.info("  touche %s", value.upper())
                 tap(value, self.cfg.action_press_duration)
                 continue
