@@ -116,11 +116,13 @@ class Config:
     banner_scales: Tuple[float, ...] = (0.9, 1.0, 1.1)  # tolérance d'échelle
 
     # --- Détection de la jauge (seuillage HSV, échelle OpenCV H:0-179) -----
-    # Valeurs par défaut génériques : utiliser --setup pour les mesurer en jeu.
-    green_lower: HSV = (40, 80, 80)
-    green_upper: HSV = (85, 255, 255)
-    yellow_lower: HSV = (20, 120, 150)
-    yellow_upper: HSV = (35, 255, 255)
+    # Mesurées sur la vraie jauge (12/11) : zone « verte » turquoise H 83-86,
+    # S ~200 ; la forêt du décor (H 40-75, S < 145) en est exclue. Ligne jaune
+    # H 24-30, S 70-145 (assez pâle), V ~255.
+    green_lower: HSV = (76, 150, 140)
+    green_upper: HSV = (95, 255, 255)
+    yellow_lower: HSV = (18, 60, 200)
+    yellow_upper: HSV = (36, 255, 255)
     gauge_min_width: int = 30               # largeur min. de la zone verte (px)
     gauge_min_aspect: float = 2.5           # largeur/hauteur min. (barre horizontale)
     gauge_bridge_px: int = 15               # comble la coupure créée par la ligne jaune
@@ -216,8 +218,19 @@ def load_config_file(cfg: Config, path: Path) -> bool:
     for name in PERSISTED_FIELDS:
         if name in data:
             value = data[name]
-            setattr(cfg, name, tuple(value) if isinstance(value, list) else value)
+            value = tuple(value) if isinstance(value, list) else value
+            if OLD_DEFAULT_COLORS.get(name) == value:
+                continue            # anciennes couleurs par défaut : les nouvelles priment
+            setattr(cfg, name, value)
     return True
+
+
+# Couleurs par défaut des versions précédentes, enregistrées telles quelles dans
+# hook_config.json : ignorées (le vert incluait la forêt du décor).
+OLD_DEFAULT_COLORS = {
+    "green_lower": (40, 80, 80), "green_upper": (85, 255, 255),
+    "yellow_lower": (20, 120, 150), "yellow_upper": (35, 255, 255),
+}
 
 
 def save_config_file(cfg: Config, path: Path) -> None:
@@ -1254,7 +1267,9 @@ class GaugeDetector:
         candidates = []
         for c in contours:
             x, y, w, h = cv2.boundingRect(c)
-            if w >= self.px(cfg.gauge_min_width, 12) and h > 0 and w / h >= cfg.gauge_min_aspect:
+            # Zone verte : barre pleine (pilule). Une forme découpée (feuillage)
+            # remplit mal son rectangle et est écartée.
+            if w >= self.px(cfg.gauge_min_width, 12) and h > 0 and w / h >= cfg.gauge_min_aspect                     and cv2.contourArea(c) >= 0.6 * w * h:
                 candidates.append((x, y, w, h))
         candidates.sort(key=lambda b: b[2] * b[3], reverse=True)
         lines = self.yellow_lines(yellow)
@@ -1356,8 +1371,8 @@ class GaugeController:
             self.cfg.invert_controls = not self.cfg.invert_controls
             self.inverted_now = True
             self._directions.clear()
-            log.warning("La ligne jaune part à l'opposé des appuis : Q et D inversés "
-                        "automatiquement (mémorisé).")
+            log.warning("La ligne jaune part à l'opposé des appuis : A et D inversés "
+                        "automatiquement (pour cette séance).")
 
     def _add_speed(self, sample: float, width: float) -> None:
         # Bornes plausibles : de 0,2 à 20 largeurs de zone verte par seconde d'appui.

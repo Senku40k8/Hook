@@ -29,7 +29,7 @@ from session import HumanConfig, Humanizer, Stats  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 TPL = ROOT / "templates"
-GREEN_BGR = (60, 200, 60)
+GREEN_BGR = (170, 202, 44)          # turquoise de la vraie jauge
 YELLOW_BGR = (0, 230, 255)
 GREY_BGR = (60, 60, 60)
 
@@ -260,6 +260,7 @@ class SimulationTest(unittest.TestCase):
                       hook._key_state, hook._visible_cursor_in_corner)
         self.saved_layout = hook.layout_char
         hook.layout_char = lambda k: k      # clavier QWERTY, quel que soit le PC
+        hook._first_track_done = hook._gauge_miss_saved = hook._banner_miss_saved = True
         # Indépendant du vrai clavier et de la vraie souris : Échap, F8 ou la souris
         # dans un coin pendant les tests (ou le bot lancé en parallèle) ne doivent
         # pas interrompre la simulation.

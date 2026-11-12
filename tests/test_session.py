@@ -27,6 +27,8 @@ def setUpModule():
     hook._key_state = lambda vk: 0
     hook._visible_cursor_in_corner = lambda: False
     hook.layout_char = lambda k: k          # clavier QWERTY, quel que soit le PC
+    # Pas d'images de diagnostic dans debug/ : elles écraseraient celles du vrai jeu.
+    hook._first_track_done = hook._gauge_miss_saved = hook._banner_miss_saved = True
 
 
 def tearDownModule():
@@ -245,7 +247,7 @@ class ControllerLearningTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Cycle complet contre un faux jeu
 # --------------------------------------------------------------------------- #
-GREEN_BGR = (60, 200, 60)
+GREEN_BGR = (170, 202, 44)          # turquoise de la vraie jauge
 YELLOW_BGR = (0, 230, 255)
 
 

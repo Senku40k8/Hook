@@ -21,7 +21,7 @@ from hook import (  # noqa: E402
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "templates" / "fish_on_hook.png"
 
-GREEN_BGR = (60, 200, 60)
+GREEN_BGR = (170, 202, 44)          # turquoise de la vraie jauge
 YELLOW_BGR = (0, 230, 255)
 GREY_BGR = (60, 60, 60)
 
@@ -228,6 +228,45 @@ class BannerOtherResolutionTest(unittest.TestCase):
                     score, box = detector.locate(frame)
                     self.assertGreaterEqual(score, threshold)
                     self.assertLess(abs(box[0] - x * real) + abs(box[1] - y * real), 10)
+
+
+class RealGaugeTest(unittest.TestCase):
+    """Cas du 12/11 : point de pêche avec une forêt à la hauteur de la jauge. Son
+    vert était pris pour la zone verte (600 px jusqu'au bord de l'écran) et le bot
+    poussait la ligne à droite sans fin. Vraie capture de la jauge (zone de 195 px,
+    ligne en bout de course à x=1185), avec de la forêt recopiée à côté."""
+
+    PATH = TEMPLATE.parent / "originals" / "gauge forest.png"
+
+    def frame(self, forest: bool):
+        frame = cv2.imread(str(self.PATH))
+        if frame is None:
+            self.skipTest("capture absente")
+        if forest:
+            frame[80:122, 780:1170] = frame[170:212, 1000:1390]   # feuillage de la capture
+        return frame
+
+    def test_real_gauge_colors(self):
+        state = GaugeDetector(Config()).detect(self.frame(forest=False))
+        self.assertEqual((state.green_left, state.green_right), (546, 741))
+        self.assertAlmostEqual(state.yellow_x, 1185, delta=3)
+
+    def test_forest_is_not_the_green_zone(self):
+        frame = self.frame(forest=True)
+        old = Config()
+        old.green_lower, old.green_upper = (40, 80, 80), (85, 255, 255)
+        self.assertNotEqual(GaugeDetector(old).detect(frame).green_left, 546)  # ancien : la forêt
+        state = GaugeDetector(Config()).detect(frame)
+        self.assertEqual((state.green_left, state.green_right), (546, 741))
+
+    def test_old_default_colors_in_config_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cfg.json"
+            path.write_text('{"green_lower": [40, 80, 80], "green_upper": [85, 255, 255]}',
+                            encoding="utf-8")
+            cfg = Config()
+            load_config_file(cfg, path)
+        self.assertEqual(cfg.green_lower, Config().green_lower)
 
 
 class ScreenCaptureTest(unittest.TestCase):
