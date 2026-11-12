@@ -451,6 +451,7 @@ class FakeShop:
         self.confirm_on_buy = True             # False : petit achat, « Rewards » direct
         self.menu_key = "q"                    # touche qui ouvre le menu du marchand
         self.extra_rewards = 0                 # « Rewards » supplémentaires après la vente
+        self.tall_rewards = False              # fenêtre « Rewards » jusqu'au texte
         self.ghost_purchase = False            # 1er Purchase visible derrière la boutique
         self.ghost_box = None
         self.keys, self.clicks, self.events = [], [], []
@@ -520,7 +521,11 @@ class FakeShop:
         hit = None
         for name, (bx, by, bw, bh) in self.drawn:
             if name == "rewards_close":
-                if cy < by:                    # zone vide au-dessus du texte
+                inside_text = bx <= cx <= bx + bw and by <= cy <= by + bh
+                # Fenêtre « Rewards » haute (vente) : elle descend jusqu'au
+                # texte, un clic juste au-dessus tombe dedans (sans effet).
+                in_window = self.tall_rewards and cy < by and cy > by - 4 * bh
+                if not inside_text and not in_window:   # zone vide
                     hit = name
                 continue
             if name == "bait_slot_empty":
@@ -1055,6 +1060,15 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(record.outcome, "restock")
         sell = self.SELL[:-1] + ["rewards_close"] * 5            # 1 + 4 fenêtres
         self.assertEqual(self.shop.clicks, sell + self.BUY + self.EQUIP)
+        self.assertEqual(self.shop.stock, 98)
+
+    def test_tall_rewards_window_closed_by_clicking_elsewhere(self):
+        """Cas du 12/11 (autre PC) : la fenêtre « Rewards » de la vente descend jusqu'au
+        texte ; un clic au-dessus du texte tombe dedans. Le bot clique ailleurs (sous le
+        texte, sur les côtés) et la ferme."""
+        self.shop.tall_rewards = True
+        record = self.cycle()
+        self.assertEqual(record.outcome, "restock")
         self.assertEqual(self.shop.stock, 98)
 
     def test_unexpected_menu_is_closed_after_banner_timeout(self):

@@ -1888,7 +1888,24 @@ class Restocker:
         # suivante, pas un échec ; on ne s'arrête qu'après 8 clics sans fin.
         for attempt in range(8):
             x, y, w, h = hint
-            empty_area = (x + w // 6, int(y - 2.6 * h), w * 2 // 3, int(1.4 * h))
+            # Zones vides essayées tour à tour : sous le texte (la fenêtre est
+            # toujours au-dessus), à gauche et à droite du texte, puis juste
+            # au-dessus (une grande fenêtre « Rewards », après une vente, peut
+            # descendre jusqu'au texte : un clic au-dessus tombe alors dedans).
+            win = search_region()
+            bottom = win[1] + win[3]
+            below_top = y + int(1.4 * h)
+            below_h = min(int(0.8 * h), bottom - below_top - 2)
+            areas = []
+            if below_h >= 4:
+                areas.append((x + w // 6, below_top, w * 2 // 3, below_h))
+            side_w = max(4, w // 4)
+            if x - w // 2 - side_w > win[0]:
+                areas.append((x - w // 2 - side_w, y, side_w, h))
+            if x + w + w // 2 + side_w < win[0] + win[2]:
+                areas.append((x + w + w // 2, y, side_w, h))
+            areas.append((x + w // 6, int(y - 2.6 * h), w * 2 // 3, int(1.4 * h)))
+            empty_area = areas[attempt % len(areas)]
             sleep(human.reaction())
             log.info("  clic dans une zone vide (fermeture de « Rewards »)%s",
                      f", fenêtre {attempt + 1}" if attempt else "")
