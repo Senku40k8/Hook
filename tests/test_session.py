@@ -1057,6 +1057,15 @@ class RestockTest(unittest.TestCase):
         self.assertEqual(self.shop.clicks, sell + self.BUY + self.EQUIP)
         self.assertEqual(self.shop.stock, 98)
 
+    def test_unexpected_menu_is_closed_after_banner_timeout(self):
+        """Cas du 12/11 : « Fish Market » ouvert par surprise, F n'y fait rien, plus de
+        bannière. Le bot ferme le menu (Échap, un seul) au lieu d'attendre en vain."""
+        self.shop.screen = "menu"
+        record = self.cycle()
+        self.assertEqual(record.outcome, "no_banner")
+        self.assertEqual(self.shop.keys, ["f", "esc"])
+        self.assertEqual(self.shop.screen, "fishing_mode")
+
     def test_preparations_panel_gets_no_keys(self):
         """Cas du 08/11 (autre PC) : panneau « Fishing Preparations » ouvert, case
         d'appât non reconnue. Là, F, E, R… ne font rien : le bot ne doit envoyer

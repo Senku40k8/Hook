@@ -346,6 +346,15 @@ class ScancodeKeyboardTest(unittest.TestCase):
         self.assertTrue(all(codes.values()))
         self.assertEqual(len(set(codes.values())), 3)
 
+    def test_second_instance_is_detected(self):
+        """Cas du 12/11 : deux bots lancés, l'Échap de l'un a arrêté l'autre."""
+        saved = hook._instance_mutex
+        try:
+            hook.another_instance_running()
+            self.assertTrue(hook.another_instance_running())
+        finally:
+            hook._instance_mutex = saved
+
     def test_game_keys_ignore_windows_layout(self):
         """Cas du 09/11 : le jeu affiche « Pull Left A » et « Q » pour le marchand,
         par position QWERTY. Mêmes scancodes en AZERTY comme en QWERTY : A = touche

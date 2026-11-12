@@ -2213,6 +2213,12 @@ def run_cycle(cfg: Config, banner: BannerDetector, gauge: GaugeDetector, number:
     if seen is None:
         log.warning("Bannière non détectée après %.0f s, cycle abandonné.", cfg.banner_timeout)
         check_blockers(cfg, stoppers)
+        # Un menu ouvert par surprise (ex. « Fish Market », 12/11) empêche de pêcher :
+        # Échap tant qu'un menu connu est visible, puis on reprend.
+        if restocker is not None and restocker.menu_open():
+            log.warning("Un menu est ouvert (ex. « Fish Market ») : fermeture avec Échap.")
+            restocker.close_menus()
+            return CycleRecord(number, "no_banner")
         if may_restock_blind and may_restock and restocker is not None:
             log.info("Peut-être plus d'appâts : tentative de réapprovisionnement.")
             restock_or_stop(cfg, restocker)
@@ -2546,6 +2552,22 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
             sleep(human.within((1.0, 2.0)))
 
 
+_instance_mutex = None
+
+
+def another_instance_running() -> bool:
+    """True si un autre bot tourne déjà sur ce PC (mutex Windows nommé). Deux bots
+    en même temps se gênent : l'Échap de l'un arrête l'autre, et leurs touches
+    et clics se mélangent (cas du 12/11)."""
+    global _instance_mutex
+    if sys.platform != "win32":
+        return False
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = ctypes.c_void_p
+    _instance_mutex = k32.CreateMutexW(None, False, r"Local\HookFishingBot")
+    return ctypes.get_last_error() == 183           # ERROR_ALREADY_EXISTS
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global keyboard, target, human, PAUSE_VK
     args = parse_args(argv)
@@ -2574,6 +2596,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg = build_config(args)
     except ValueError as exc:
         log.error("%s", exc)
+        return 1
+    if another_instance_running():
+        log.error("Le bot tourne déjà dans une autre fenêtre : fermez-la (ou appuyez sur "
+                  "Échap dans le jeu) avant de le relancer. Deux bots en même temps se gênent.")
         return 1
     human = Humanizer(cfg.human)
     PAUSE_VK = cfg.pause_vk
