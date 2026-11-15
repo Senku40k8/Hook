@@ -29,6 +29,7 @@ def setUpModule():
     hook.layout_char = lambda k: k          # clavier QWERTY, quel que soit le PC
     # Pas d'images de diagnostic dans debug/ : elles écraseraient celles du vrai jeu.
     hook._first_track_done = hook._gauge_miss_saved = hook._banner_miss_saved = True
+    hook._sale_saved.update({"confirm", "rewards"})
 
 
 def tearDownModule():

@@ -261,6 +261,7 @@ class SimulationTest(unittest.TestCase):
         self.saved_layout = hook.layout_char
         hook.layout_char = lambda k: k      # clavier QWERTY, quel que soit le PC
         hook._first_track_done = hook._gauge_miss_saved = hook._banner_miss_saved = True
+        hook._sale_saved.update({"confirm", "rewards"})
         # Indépendant du vrai clavier et de la vraie souris : Échap, F8 ou la souris
         # dans un coin pendant les tests (ou le bot lancé en parallèle) ne doivent
         # pas interrompre la simulation.

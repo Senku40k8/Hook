@@ -1541,6 +1541,25 @@ def save_banner_miss(score: float, frame: Optional[np.ndarray]) -> None:
         log.debug("Capture impossible : %s", exc)
 
 
+_sale_saved: set = set()
+
+
+def save_sale_capture(label: str) -> None:
+    """Capture (une fois par lancement et par étape) des fenêtres de la vente
+    (« confirm » avant le clic, « rewards » après), pour savoir où le jeu
+    affiche le total en Fons."""
+    if label in _sale_saved:
+        return
+    _sale_saved.add(label)
+    try:
+        out = Path("debug") / f"sale_{label}_{time.strftime('%H%M%S')}.png"
+        out.parent.mkdir(exist_ok=True)
+        cv2.imwrite(str(out), grab(search_region()))
+        log.info("  capture de la vente enregistrée : %s", out)
+    except Exception as exc:                # diagnostic seulement : jamais bloquant
+        log.debug("Capture impossible : %s", exc)
+
+
 def wait_for_gauge(cfg: Config, detector: GaugeDetector) -> bool:
     """Attend la jauge. Zone mémorisée vide pendant 1.5 s : on cherche aussi dans
     tout le haut de la fenêtre (zone périmée), et on mémorise la nouvelle."""
@@ -1875,13 +1894,16 @@ class Restocker:
         click_box(click_area("bait_slot_empty", box))
         return "panel"
 
-    def dismiss_popup(self, name: str) -> None:
-        """Ferme une fenêtre du type « Rewards » en cliquant dans une zone vide."""
+    def dismiss_popup(self, name: str, capture: Optional[str] = None) -> None:
+        """Ferme une fenêtre du type « Rewards » en cliquant dans une zone vide.
+        capture : nom de la capture à enregistrer avant le premier clic."""
         try:
             hint = self.wait_for_button(name, timeout=3.0, quiet=True)
         except RestockFailed:
             log.debug("  pas de fenêtre « Rewards » à fermer")
             return
+        if capture:
+            save_sale_capture(capture)
         detector = self.buttons[name]
         # Plusieurs « Rewards » peuvent se suivre (une par récompense) : on les
         # ferme une à une. Une fenêtre qui disparaît puis réapparaît est la
@@ -2108,7 +2130,7 @@ class Restocker:
                 self.open_bait_dialog()
                 continue
             if action == "dismiss":
-                self.dismiss_popup(value)
+                self.dismiss_popup(value, capture="rewards" if "quick_sell" in clicked else None)
                 continue
             if action == "confirm_rewards":
                 # Le premier des deux qui s'affiche décide de la suite.
@@ -2131,6 +2153,8 @@ class Restocker:
                 # Bouton déjà cliqué (2e « Purchase ») : surtout pas le même.
                 box = self.wait_for_button(value, avoid=before)
             clicked.setdefault(value, []).append(box)
+            if value == "confirm" and "quick_sell" in clicked:
+                save_sale_capture("confirm")   # montant de la vente, avant le clic
             sleep(human.reaction())       # temps de repérer le bouton apparu
             log.info("  clic sur %s", value)
             click_box(click_area(value, box))
