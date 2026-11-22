@@ -190,6 +190,12 @@ juste après un achat (plus de coquillages ?), il s'arrête au lieu de boucler.
 - **Statistiques** : chaque cycle est ajouté à `logs/catches.csv`, qui s'ouvre dans Excel. On
   y trouve le résultat, l'attente de la bannière, la durée de la jauge, le nombre d'appuis
   sur Q et D, et la part du temps passée dans le vert. Un résumé s'affiche à l'arrêt.
+- **Fons gagnés** : à chaque vente, le bot lit le total affiché sous « Income Details »
+  (avec l'OCR intégré à Windows, installé par `start.bat`). Le résumé donne les Fons
+  encaissés et les Fons par heure. Après deux ventes dans la même session, le bot
+  connaît aussi le prix moyen d'un poisson. Il donne alors une estimation des Fons
+  gagnés par heure, avant et après le prix des appâts (5 Fons pièce). Ce prix moyen
+  est retenu pour les sessions suivantes.
 
 ## Options
 

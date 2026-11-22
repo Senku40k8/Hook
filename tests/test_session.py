@@ -165,6 +165,29 @@ class StatsTest(unittest.TestCase):
             self.assertIn("2 poisson(s)", summary)
             self.assertIn("échec 1", summary)
 
+    def test_fons_per_hour_from_sales(self):
+        """Ventes lues à l'écran : Fons encaissés, Fons par poisson appris entre deux
+        ventes, Fons par heure bruts et nets (appâts payés)."""
+        clock = FakeClock()
+        stats = Stats(None, clock=clock, bait_price=5)
+        stats.add_sale(1000)                 # poissons d'avant la session : rien appris
+        self.assertIsNone(stats.fons_per_fish)
+        for i in range(100):
+            stats.add(CycleRecord(i, "success"))
+        stats.add_sale(2000)                 # 100 poissons -> 20 Fons par poisson
+        self.assertEqual(stats.fons_per_fish, 20)
+        clock.t += 3600
+        summary = stats.summary()
+        self.assertIn("Fons encaissés : 3 000 en 2 vente(s), soit 3 000 Fons/heure", summary)
+        self.assertIn("~2 000 Fons/heure (~20 par poisson), ~1 500 Fons/heure", summary)
+
+    def test_amount_parsing(self):
+        self.assertEqual(hook.parse_amount(["x", "1972"]), 1972)
+        self.assertEqual(hook.parse_amount(["*1,615"]), 1615)
+        self.assertEqual(hook.parse_amount(["xl9O4"]), 1904)
+        self.assertIsNone(hook.parse_amount(["Income", "Details"]))
+        self.assertIsNone(hook.parse_amount([]))
+
 
 # --------------------------------------------------------------------------- #
 # Apprentissage du contrôleur
@@ -691,6 +714,30 @@ class RealScreenshotTest(unittest.TestCase):
                              "rewards_close")
         finally:
             hook.grab = saved
+
+    def test_sale_income_read_on_real_captures(self):
+        """Vraies captures de fin de vente (21/11) : le total en Fons, sous « Income
+        Details », est lu, même à côté d'une autre monnaie, et à d'autres
+        résolutions. Rien n'est lu sur la fenêtre de confirmation."""
+        hook.ocr_words(np.full((40, 40, 3), 255, np.uint8))
+        if hook._ocr_unavailable:
+            self.skipTest("OCR Windows indisponible")
+        cases = {"sale rewards.jpg": 1972, "sale rewards two currencies.jpg": 1994}
+        saved = (hook.UI.candidates, hook.UI.locked, hook.UI.on_lock)
+        hook.UI.on_lock = None
+        try:
+            for size in ((2560, 1600), (1920, 1080)):
+                hook.UI.configure(*size)
+                restocker = hook.Restocker(hook.Config())
+                for name, amount in cases.items():
+                    img = cv2.imread(str(ROOT / "templates" / "originals" / name))
+                    if size[0] != 2560:
+                        img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+                    self.assertEqual(restocker.read_income(img), amount, f"{name} {size}")
+            confirm = cv2.imread(str(ROOT / "templates" / "originals" / "quick sell confirm.jpg"))
+            self.assertIsNone(restocker.read_income(confirm))
+        finally:
+            hook.UI.candidates, hook.UI.locked, hook.UI.on_lock = saved
 
     def test_rewards_popup_after_confirm(self):
         """Vraie capture de la fenêtre « Rewards » (07/11, 16:59) : seul le texte

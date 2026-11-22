@@ -293,6 +293,7 @@ OUTCOME_LABELS = {
     "restock": "réapprovisionnement en appâts",
 }
 CATCH_OUTCOMES = {"success", "unknown"}             # comptés comme poissons
+BAIT_OUTCOMES = CATCH_OUTCOMES | {"fail", "no_gauge", "timeout"}   # un appât utilisé
 FAILURE_OUTCOMES = {"fail", "no_banner", "no_gauge", "timeout"}
 
 
@@ -309,12 +310,28 @@ class CycleRecord:
 
 
 class Stats:
-    def __init__(self, csv_path: Optional[Path] = None, clock: Clock = time.monotonic):
+    def __init__(self, csv_path: Optional[Path] = None, clock: Clock = time.monotonic,
+                 fons_per_fish: Optional[float] = None, bait_price: int = 5):
         self.csv_path = csv_path
         self.records: List[CycleRecord] = []
         self.clock = clock
         self.started_at = clock()
         self.consecutive_failures = 0
+        self.sales: List[int] = []                  # Fons de chaque vente
+        self.fons_per_fish = fons_per_fish          # appris sur les ventes précédentes
+        self.bait_price = bait_price
+        self._fish_at_last_sale: Optional[int] = None
+
+    def add_sale(self, amount: int) -> None:
+        """Vente de tous les poissons pêchés : entre deux ventes de la session, on
+        connaît leur nombre, donc les Fons rapportés par poisson. (La première
+        vente compte aussi des poissons pêchés avant la session.)"""
+        if self._fish_at_last_sale is not None:
+            sold = self.fish - self._fish_at_last_sale
+            if sold >= 10:
+                self.fons_per_fish = amount / sold
+        self._fish_at_last_sale = self.fish
+        self.sales.append(amount)
 
     @property
     def fish(self) -> int:
@@ -367,6 +384,29 @@ class Stats:
             avg_d = sum(r.gauge_duration for r in gauges) / len(gauges)
             avg_z = sum(r.in_zone_ratio for r in gauges) / len(gauges)
             lines.append(f"Jauge : {avg_d:.1f} s en moyenne, ligne dans le vert {avg_z:.0%}.")
+        hours = elapsed / 3600
         if elapsed > 60:
-            lines.append(f"Rythme : {self.fish / (elapsed / 3600):.0f} poissons/heure.")
+            lines.append(f"Rythme : {self.fish / hours:.0f} poissons/heure.")
+        lines += self._fons_lines(hours)
         return "\n".join(lines)
+
+    def _fons_lines(self, hours: float) -> List[str]:
+        lines = []
+        if self.sales:
+            total = sum(self.sales)
+            lines.append(f"Fons encaissés : {fons(total)} en {len(self.sales)} vente(s)"
+                         + (f", soit {fons(total / hours)} Fons/heure" if hours > 1 / 60 else "")
+                         + ".")
+        if self.fons_per_fish and hours > 1 / 60:
+            baits = sum(r.outcome in BAIT_OUTCOMES for r in self.records)
+            gross = self.fons_per_fish * self.fish / hours
+            net = gross - self.bait_price * baits / hours
+            lines.append(f"Fons gagnés : ~{fons(gross)} Fons/heure (~{self.fons_per_fish:.0f} "
+                         f"par poisson), ~{fons(net)} Fons/heure une fois payés les appâts "
+                         f"({self.bait_price} Fons pièce).")
+        return lines
+
+
+def fons(value: float) -> str:
+    """12345.6 -> « 12 346 »."""
+    return f"{value:,.0f}".replace(",", " ")

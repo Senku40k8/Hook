@@ -43,6 +43,7 @@ import ctypes
 import json
 import logging
 import random
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -193,6 +194,10 @@ class Config:
     # bannière « Fish on the hook » n'arrive pas. Inutile tant que la case vide est
     # vérifiée avant chaque cycle.
     restock_on_no_banner: bool = False
+    # Fons rapportés en moyenne par poisson : appris en lisant le total de chaque
+    # vente (« Income Details »), pour estimer les Fons gagnés par heure.
+    fons_per_fish: Optional[float] = None
+    bait_price: int = 5                     # prix d'un Universal Bait, en Fons
 
     # --- Session, comportement humain, statistiques -------------------------
     human: HumanConfig = field(default_factory=HumanConfig)
@@ -206,7 +211,7 @@ PERSISTED_FIELDS = (
     "banner_region", "gauge_region", "regions_window",
     "green_lower", "green_upper", "yellow_lower", "yellow_upper",
     "input_backend", "window_title", "line_speed", "sell_menu_key",
-    "ui_scale_exact", "ui_scale_size",
+    "ui_scale_exact", "ui_scale_size", "fons_per_fish",
 )
 
 
@@ -1541,6 +1546,64 @@ def save_banner_miss(score: float, frame: Optional[np.ndarray]) -> None:
         log.debug("Capture impossible : %s", exc)
 
 
+_ocr_engine = None
+_ocr_unavailable = False
+
+
+def ocr_words(img: np.ndarray) -> List[str]:
+    """Mots lus par l'OCR intégré à Windows (paquets winrt-*, voir
+    requirements.txt). Liste vide si l'OCR n'est pas disponible."""
+    global _ocr_engine, _ocr_unavailable
+    if _ocr_unavailable:
+        return []
+    try:
+        import asyncio
+        from winrt.windows.graphics.imaging import (BitmapAlphaMode, BitmapPixelFormat,
+                                                    SoftwareBitmap)
+        from winrt.windows.storage.streams import DataWriter
+        if _ocr_engine is None:
+            from winrt.windows.globalization import Language
+            from winrt.windows.media.ocr import OcrEngine
+            _ocr_engine = (OcrEngine.try_create_from_language(Language("en-US"))
+                           or OcrEngine.try_create_from_user_profile_languages())
+            if _ocr_engine is None:
+                raise RuntimeError("aucune langue d'OCR installée")
+        bgra = np.ascontiguousarray(cv2.cvtColor(img, cv2.COLOR_BGR2BGRA))
+        h, w = bgra.shape[:2]
+        writer = DataWriter()
+        writer.write_bytes(bgra.tobytes())
+        bitmap = SoftwareBitmap.create_copy_from_buffer(
+            writer.detach_buffer(), BitmapPixelFormat.BGRA8, w, h, BitmapAlphaMode.PREMULTIPLIED)
+
+        async def recognize():
+            return await _ocr_engine.recognize_async(bitmap)
+        result = asyncio.run(recognize())
+        return [word.text for line in result.lines for word in line.words]
+    except Exception as exc:
+        _ocr_unavailable = True
+        log.warning("Lecture du texte (OCR Windows) impossible : %s. Les Fons gagnés ne "
+                    "seront pas comptés (relancez start.bat pour installer les paquets).", exc)
+        return []
+
+
+# Confusions habituelles de l'OCR sur des chiffres.
+_OCR_DIGITS_SRC = {"O": "0", "o": "0", "D": "0", "I": "1", "l": "1", "|": "1", "i": "1",
+                   "S": "5", "s": "5", "B": "8", "Z": "2", "z": "2", "g": "9", "q": "9"}
+_OCR_DIGITS = str.maketrans(_OCR_DIGITS_SRC)
+
+
+def parse_amount(words: Sequence[str]) -> Optional[int]:
+    """« x1972 » (ou « x 1,972 ») -> 1972. None si aucun nombre lisible."""
+    text = "".join(words).replace(" ", "")
+    text = re.sub(r"^[xX×*+]", "", text)
+    # Seulement des chiffres (ou des lettres qui leur ressemblent) : un mot
+    # comme « Income » n'est pas un nombre.
+    if not re.fullmatch(r"[0-9" + re.escape("".join(_OCR_DIGITS_SRC)) + r",.]+", text):
+        return None
+    value = int(text.translate(_OCR_DIGITS).replace(",", "").replace(".", ""))
+    return value if 0 < value < 100_000_000 else None
+
+
 _sale_saved: set = set()
 
 
@@ -1779,7 +1842,7 @@ SELL_STEPS: Tuple[Tuple[str, str], ...] = (
 )
 RESTOCK_BUTTONS = sorted({name for steps in (SELL_STEPS, BUY_STEPS)
                           for action, name in steps if action not in ("key", "escape_menu")}
-                         | {"bait_slot_empty"})
+                         | {"bait_slot_empty", "income_details", "fons_icon"})
 # Boutons qui indiquent qu'un menu est encore ouvert (à fermer avec Échap après
 # un échec) ; le panneau « Fishing Preparations » n'en fait pas partie.
 MENU_BUTTONS = ("cancel", "switch", "purchase", "confirm", "universal_bait", "max_quantity",
@@ -1823,6 +1886,7 @@ class Restocker:
                 name, cfg.restock_icon_threshold if icon else cfg.restock_threshold)
             self.buttons[name] = BannerDetector(
                 cfg.restock_dir / f"{name}.png", threshold, cfg.banner_scales, edges=icon)
+        self.on_sale = None                 # rappel (Fons) à chaque vente lue
 
     def wait_for_any(self, names: Sequence[str], timeout: Optional[float] = None) -> str:
         """Attend que l'un des boutons soit visible et immobile ; renvoie son nom."""
@@ -1894,16 +1958,17 @@ class Restocker:
         click_box(click_area("bait_slot_empty", box))
         return "panel"
 
-    def dismiss_popup(self, name: str, capture: Optional[str] = None) -> None:
+    def dismiss_popup(self, name: str, sale: bool = False) -> None:
         """Ferme une fenêtre du type « Rewards » en cliquant dans une zone vide.
-        capture : nom de la capture à enregistrer avant le premier clic."""
+        sale : fenêtre de fin de vente, dont on lit le total en Fons."""
         try:
             hint = self.wait_for_button(name, timeout=3.0, quiet=True)
         except RestockFailed:
             log.debug("  pas de fenêtre « Rewards » à fermer")
             return
-        if capture:
-            save_sale_capture(capture)
+        if sale:
+            save_sale_capture("rewards")
+            self.record_income()
         detector = self.buttons[name]
         # Plusieurs « Rewards » peuvent se suivre (une par récompense) : on les
         # ferme une à une. Une fenêtre qui disparaît puis réapparaît est la
@@ -1951,6 +2016,55 @@ class Restocker:
         self._save_failure(name, grab(search_region()), detector,
                            "La fenêtre « Rewards » reste affichée après 8 clics.")
         raise RestockFailed("la fenêtre « Rewards » ne se ferme pas")
+
+    def read_income(self, frame: np.ndarray) -> Optional[int]:
+        """Total en Fons de la fenêtre de fin de vente : nombre à droite de l'icône
+        des Fons, sous « Income Details » (parfois à côté d'une autre monnaie)."""
+        title = self.buttons["income_details"]
+        score, box = title.locate(frame)
+        if box is None or score < title.threshold:
+            return None
+        tx, ty, tw, th = box
+        x0, y0 = max(0, tx - tw), ty + th
+        bar = frame[y0:y0 + int(2.4 * th), x0:tx + 2 * tw]
+        icon = self.buttons["fons_icon"]
+        score, ibox = icon.locate(bar)
+        if ibox is None or score < icon.threshold:
+            return None
+        ix, iy, iw, ih = ibox
+        text = bar[max(0, iy - ih // 4):iy + ih + ih // 4, ix + iw:ix + iw + 5 * iw]
+        if text.size == 0:
+            return None
+        # Texte blanc sur fond sombre, inversé. L'OCR Windows ne lit pas toujours
+        # la même image : plusieurs préparations (essayées sur de vraies captures
+        # à 5 résolutions), et un nombre n'est retenu que lu deux fois.
+        gray = 255 - cv2.cvtColor(text, cv2.COLOR_BGR2GRAY)
+        seen: List[int] = []
+        for height, binary, pad in ((40, True, 10), (40, False, 10), (40, False, 40),
+                                    (90, True, 40), (60, True, 10), (60, False, 10)):
+            scale = height / gray.shape[0]
+            img = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            if binary:
+                img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            img = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+            value = parse_amount(ocr_words(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)))
+            if value is not None:
+                if value in seen:
+                    return value
+                seen.append(value)
+        return None
+
+    def record_income(self) -> None:
+        """Lit le total de la vente (au plus 3 images) et le transmet à on_sale."""
+        for _ in range(3):
+            value = self.read_income(grab(search_region()))
+            if value is not None:
+                if self.on_sale:
+                    self.on_sale(value)
+                log.info("  vente : %s Fons.", f"{value:,}".replace(",", " "))
+                return
+            sleep(0.25)
+        log.info("  montant de la vente illisible.")
 
     def escape_menu(self) -> None:
         """Échap pour quitter le menu du marchand, vérifié : si le menu est encore
@@ -2130,7 +2244,7 @@ class Restocker:
                 self.open_bait_dialog()
                 continue
             if action == "dismiss":
-                self.dismiss_popup(value, capture="rewards" if "quick_sell" in clicked else None)
+                self.dismiss_popup(value, sale="quick_sell" in clicked)
                 continue
             if action == "confirm_rewards":
                 # Le premier des deux qui s'affiche décide de la suite.
@@ -2553,6 +2667,16 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
         log.info("Messages bloquants surveillés : %s", ", ".join(stoppers.names()))
     no_bait, restocker = restock_tools(cfg)
     fishing_prompt = fishing_prompt_detector(cfg)
+    stats.fons_per_fish = stats.fons_per_fish or cfg.fons_per_fish
+    stats.bait_price = cfg.bait_price
+    if restocker is not None:
+        def record_sale(amount: int) -> None:
+            stats.add_sale(amount)
+            if stats.fons_per_fish and stats.fons_per_fish != cfg.fons_per_fish:
+                cfg.fons_per_fish = round(stats.fons_per_fish, 2)
+                log.info("  soit ~%.0f Fons par poisson.", cfg.fons_per_fish)
+                remember_regions(cfg)
+        restocker.on_sale = record_sale
 
     cycle = 0
     while args.cycles == 0 or cycle < args.cycles:
