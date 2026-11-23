@@ -727,9 +727,9 @@ class FrenzyTest(unittest.TestCase):
         frenzy.step()
         self.assertEqual(self.events[-1][0], "click")              # Start Fishing
 
-    def test_net_presses_w_every_5_5_s_instead_of_clicking(self):
-        """Filet affiché : plus aucun clic, la touche W toutes les ~5,5 s jusqu'à la
-        fin de la partie (Échap) ; la partie suivante repart sans filet."""
+    def test_net_presses_w_then_one_click_every_5_5_s(self):
+        """Filet affiché : W une fois, puis un clic toutes les ~5,5 s jusqu'à la fin
+        de la partie (Échap) ; la partie suivante repart sans filet."""
         frame = np.full((1600, 2560, 3), 60, np.uint8)
         net = cv2.imread(str(ROOT / "templates" / "originals" / "net.png"))
         frame[1150:1150 + net.shape[0], 1200:1200 + net.shape[1]] = net
@@ -738,15 +738,14 @@ class FrenzyTest(unittest.TestCase):
         frenzy.step()
         self.assertEqual(self.events, [("key", "w")])
         self.assertTrue(frenzy.net_mode)
-        self.assertTrue(4.5 < self.waited[-1] < 6.7, self.waited)   # ~5,5 s avant le W suivant
         pauses = []
         for _ in range(30):
             self.waited.clear()
             t0 = time.perf_counter()
-            frenzy.step()                       # filet toujours visible : W, pas de clic
-            # Intervalle d'un W au suivant : temps d'analyse + pause restante.
+            frenzy.step()                       # filet toujours visible : pas de second W
+            # Intervalle d'un clic au suivant : temps d'analyse + pause restante.
             pauses.append(time.perf_counter() - t0 + self.waited[-1])
-        self.assertEqual(self.events[1:], [("key", "w")] * 30)
+        self.assertEqual([e[0] for e in self.events[1:]], ["click"] * 30)
         self.assertTrue(all(4.5 < p < 6.7 for p in pauses), pauses)
         self.assertAlmostEqual(sum(pauses) / len(pauses), 5.5, delta=0.35)
         self.assertGreater(len({round(p, 2) for p in pauses}), 20)      # jamais régulier

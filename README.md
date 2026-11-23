@@ -125,9 +125,9 @@ Un cycle sans fin, décidé d'après ce qui est à l'écran :
 - **Invite « Fishing »** du point de pêche : le bot appuie sur F.
 - **Panneau « Fishing Preparations »** : il clique sur « Start Fishing ». Il n'appuie jamais
   sur F sur ce panneau.
-- **Filet affiché** (icône du filet avec W) : il ne clique plus du tout et appuie sur W
-  (la touche W du jeu, Z sur un clavier AZERTY) toutes les 5,5 s environ jusqu'à la fin
-  de la partie, puis le cycle reprend (Échap, clic sur « Start Fishing »…).
+- **Filet affiché** (icône du filet avec W) : il appuie sur W (la touche W du jeu, Z sur
+  un clavier AZERTY). Jusqu'à la fin de la partie, il ne clique ensuite qu'une fois
+  toutes les 5,5 s environ, puis le cycle reprend (Échap, « Start Fishing »…).
 - **Sinon** : il clique près du centre de l'écran, environ deux fois par seconde.
 
 Les clics sont humains. Le point visé est un peu décalé du centre, tiré au hasard à
