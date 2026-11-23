@@ -2880,9 +2880,13 @@ class Frenzy:
             self.net_mode = False           # partie terminée : le filet est à revoir
         if state == "net":
             sleep(human.reaction())
-            log.info("Filet affiché : touche %s, puis un clic toutes les ~%.1f s.",
+            log.info("Filet affiché : touche %s plusieurs fois, puis un clic toutes les ~%.1f s.",
                      layout_char(FRENZY_NET_KEY).upper(), FRENZY_NET_INTERVAL)
-            tap(FRENZY_NET_KEY, self.cfg.action_press_duration)
+            # Plusieurs W espacés (sur ~2 à 4 s) : le filet n'est pas toujours
+            # prenable dès que son icône apparaît.
+            for _ in range(human.rng.randint(5, 8)):
+                tap(FRENZY_NET_KEY, self.cfg.action_press_duration)
+                sleep(human.within((0.3, 0.6)))
             self.net_mode = True
             sleep(human.within((0.6, 1.2)))
             return

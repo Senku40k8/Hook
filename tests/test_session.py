@@ -736,8 +736,10 @@ class FrenzyTest(unittest.TestCase):
         hook.grab = lambda region=None: frame
         frenzy = hook.Frenzy(hook.Config())
         frenzy.step()
-        self.assertEqual(self.events, [("key", "w")])
+        self.assertTrue(5 <= len(self.events) <= 8, self.events)     # W plusieurs fois
+        self.assertEqual(set(self.events), {("key", "w")})
         self.assertTrue(frenzy.net_mode)
+        self.events[:] = [("key", "w")]
         pauses = []
         for _ in range(30):
             self.waited.clear()
