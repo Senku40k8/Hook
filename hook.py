@@ -2792,6 +2792,8 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
 # Mode frenzy (frenzy.bat) : F sur l'invite, « Start Fishing », puis clics
 # --------------------------------------------------------------------------- #
 FRENZY_CLICK_INTERVAL: Range = (0.35, 0.7)   # d'un clic au suivant (≈ 2 par seconde)
+FRENZY_NET_INTERVAL = 5.5                     # avec le filet : un clic toutes les ~5,5 s
+FRENZY_NET_KEY = "w"                          # touche W du jeu (Z sur un clavier AZERTY)
 
 
 class Frenzy:
@@ -2799,9 +2801,12 @@ class Frenzy:
     - « Press empty area to close » (fin de partie) : Échap ;
     - panneau « Fishing Preparations » (bouton « Start Fishing ») : clic dessus ;
     - invite « Fishing » du point de pêche : F (jamais sur le panneau) ;
+    - filet visible (templates/frenzy/net.png) : W, puis jusqu'à la fin de la
+      partie, un seul clic toutes les ~5,5 s ;
     - sinon : clic au centre de l'écran, à un rythme et un endroit variables.
-    L'écran (1 à 2 s d'analyse) est examiné au lancement, après F ou « Start
-    Fishing », puis tous les 3 à 6 clics."""
+    L'écran (0,1 à 0,3 s d'analyse) est examiné au lancement, après chaque action,
+    à chaque clic pendant les 4 premières secondes d'une partie et avec le filet,
+    sinon tous les 3 à 6 clics."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -2810,6 +2815,10 @@ class Frenzy:
         self.prompt = fishing_prompt_detector(cfg)
         self.close = BannerDetector(cfg.restock_dir / "rewards_close.png",
                                     cfg.restock_threshold, cfg.banner_scales)
+        net = cfg.templates_dir / "frenzy" / "net.png"
+        self.net = BannerDetector(net, cfg.restock_threshold, cfg.banner_scales)             if net.exists() else None
+        self.net_mode = False               # filet lancé : un clic toutes les ~5,5 s
+        self.started_at = 0.0               # dernier « Start Fishing »
         self.clicks = 0
         self.until_check = 0                # clics avant le prochain examen de l'écran
         # Point visé : pas tout à fait au centre (décalage tiré à chaque lancement),
@@ -2833,6 +2842,8 @@ class Frenzy:
             return "panel", (region[0] + x0 + box[0], region[1] + y0 + box[1], box[2], box[3])
         if self.prompt is not None and self.prompt.detect(frame):
             return "prompt", None
+        if not self.net_mode and self.net is not None and self.net.detect(frame):
+            return "net", None
         return "other", None
 
     def close_visible(self, frame: Optional[np.ndarray] = None) -> bool:
@@ -2865,6 +2876,16 @@ class Frenzy:
             self.until_check = human.rng.randint(3, 6)
         if state != "other":
             self.until_check = 0            # vérifier le résultat au tour suivant
+        if state in ("close", "panel"):
+            self.net_mode = False           # partie terminée : le filet est à revoir
+        if state == "net":
+            sleep(human.reaction())
+            log.info("Filet affiché : touche %s, puis un clic toutes les ~%.1f s.",
+                     layout_char(FRENZY_NET_KEY).upper(), FRENZY_NET_INTERVAL)
+            tap(FRENZY_NET_KEY, self.cfg.action_press_duration)
+            self.net_mode = True
+            sleep(human.within((0.6, 1.2)))
+            return
         if state == "close":
             # Échap, vérifié : un second au plus, seulement si la fenêtre est
             # encore là (un Échap de trop ouvrirait le menu du jeu).
@@ -2881,6 +2902,7 @@ class Frenzy:
             sleep(human.reaction())
             log.info("« Start Fishing »")
             click_box(box)
+            self.started_at = time.perf_counter()
             sleep(human.within((1.0, 1.8)))
             return
         if state == "prompt":
@@ -2892,14 +2914,19 @@ class Frenzy:
         click_box(self.center_box())
         self.clicks += 1
         self.until_check -= 1
+        if self.net_mode or time.perf_counter() - self.started_at < 4.0:
+            self.until_check = 0            # début de partie (filet ?) ou filet lancé
         if self.clicks % 50 == 0:
             log.info("%d clics.", self.clicks)
         r = human.rng
-        pause = human.within(FRENZY_CLICK_INTERVAL)
-        if r.random() < 0.06:
-            pause = human.within((0.15, 0.25))           # clic rapproché
-        elif r.random() < 0.04:
-            pause += human.within((0.8, 2.5))            # petite hésitation
+        if self.net_mode:
+            pause = max(4.6, min(6.6, r.gauss(FRENZY_NET_INTERVAL, 0.4)))
+        else:
+            pause = human.within(FRENZY_CLICK_INTERVAL)
+            if r.random() < 0.06:
+                pause = human.within((0.15, 0.25))       # clic rapproché
+            elif r.random() < 0.04:
+                pause += human.within((0.8, 2.5))        # petite hésitation
         # Le temps passé à examiner l'écran compte dans la pause.
         sleep(max(human.within((0.05, 0.12)), pause - (time.perf_counter() - started)))
 
@@ -2987,7 +3014,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
 
         keyboard = make_keyboard(cfg.input_backend)
-        keyboard.prepare((cfg.key_action, cfg.key_left, cfg.key_right, cfg.bait_menu_key, "q", "esc"))
+        keyboard.prepare((cfg.key_action, cfg.key_left, cfg.key_right, cfg.bait_menu_key, "q", "esc",
+                          FRENZY_NET_KEY))
         log.info("Envoi des touches : %s", keyboard.name)
 
         banner = BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)

@@ -7,6 +7,7 @@ Lancer : python -m unittest discover -s tests
 import random
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -725,6 +726,37 @@ class FrenzyTest(unittest.TestCase):
         hook.grab = lambda region=None: cv2.imread(str(PREPARATIONS))
         frenzy.step()
         self.assertEqual(self.events[-1][0], "click")              # Start Fishing
+
+    def test_net_presses_w_then_one_click_every_5_5_s(self):
+        """Filet affiché : W une fois, puis un clic toutes les ~5,5 s jusqu'à la fin
+        de la partie (Échap) ; la partie suivante repart sans filet."""
+        frame = np.full((1600, 2560, 3), 60, np.uint8)
+        net = cv2.imread(str(ROOT / "templates" / "originals" / "net.png"))
+        frame[1150:1150 + net.shape[0], 1200:1200 + net.shape[1]] = net
+        hook.grab = lambda region=None: frame
+        frenzy = hook.Frenzy(hook.Config())
+        frenzy.step()
+        self.assertEqual(self.events, [("key", "w")])
+        self.assertTrue(frenzy.net_mode)
+        pauses = []
+        for _ in range(30):
+            self.waited.clear()
+            t0 = time.perf_counter()
+            frenzy.step()                       # filet toujours visible : pas de second W
+            # Intervalle d'un clic au suivant : temps d'analyse + pause restante.
+            pauses.append(time.perf_counter() - t0 + self.waited[-1])
+        self.assertEqual([e[0] for e in self.events[1:]], ["click"] * 30)
+        self.assertTrue(all(4.5 < p < 6.7 for p in pauses), pauses)
+        self.assertAlmostEqual(sum(pauses) / len(pauses), 5.5, delta=0.35)
+        self.assertGreater(len({round(p, 2) for p in pauses}), 20)      # jamais régulier
+        frenzy.until_check = 0
+        hook.grab = lambda region=None: cv2.imread(
+            str(ROOT / "templates" / "originals" / "rewards.jpg"))
+        hook.tap = lambda key, d: (self.events.append(("key", key)),
+                                   setattr(hook, "grab", lambda region=None: frame * 0 + 60))
+        frenzy.step()
+        self.assertEqual(self.events[-1], ("key", "esc"))
+        self.assertFalse(frenzy.net_mode)
 
     def test_prompt_presses_f(self):
         frame = np.full((1600, 2560, 3), 60, np.uint8)

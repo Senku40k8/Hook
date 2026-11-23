@@ -125,13 +125,17 @@ Un cycle sans fin, décidé d'après ce qui est à l'écran :
 - **Invite « Fishing »** du point de pêche : le bot appuie sur F.
 - **Panneau « Fishing Preparations »** : il clique sur « Start Fishing ». Il n'appuie jamais
   sur F sur ce panneau.
+- **Filet affiché** (icône du filet avec W) : il appuie sur W (la touche W du jeu, Z sur
+  un clavier AZERTY). Jusqu'à la fin de la partie, il ne clique ensuite qu'une fois
+  toutes les 5,5 s environ, puis le cycle reprend (Échap, « Start Fishing »…).
 - **Sinon** : il clique près du centre de l'écran, environ deux fois par seconde.
 
 Les clics sont humains. Le point visé est un peu décalé du centre, tiré au hasard à
 chaque lancement, puis il dérive lentement. Le trajet de la souris, la durée d'appui et
 l'intervalle entre deux clics varient, avec parfois un clic rapproché ou une hésitation.
 
-L'écran est examiné tous les 3 à 6 clics, et juste après Échap, F ou « Start Fishing ».
+L'écran est examiné juste après chaque action, à chaque clic pendant les 4 premières
+secondes d'une partie et avec le filet, sinon tous les 3 à 6 clics.
 Échap arrête le mode frenzy, F8 le met en pause.
 
 ## Comportement humain et sessions
