@@ -94,6 +94,46 @@ réellement bougé. Il en déduit la vitesse de la ligne et dose ensuite ses app
 conséquence. Cette vitesse est mémorisée d'une partie à l'autre. Si la ligne part
 systématiquement à l'opposé de l'appui, A et D sont inversés automatiquement (pour la séance en cours).
 
+## Canne à pêche et précision
+
+Sur le panneau « Fishing Preparations », le bot lit la canne choisie, de « Fishing Rod I »
+à « Fishing Rod IV ». Avec une canne plus faible, il suit la zone verte de plus près :
+
+| Canne | Tolérance autour de la cible | Corrections | Imperfections humaines |
+|---|---|---|---|
+| IV (par défaut) | 15 % de la zone verte | rythme normal | normales |
+| III | 12 % | un peu plus fréquentes | −30 % |
+| II | 9 % | plus fréquentes | −50 % |
+| I | 7 % | encore plus fréquentes | −65 % |
+
+Les imperfections restent présentes à tous les niveaux : corrections parfois en retard,
+appuis parfois trop longs, durées variables. La dernière canne vue est retenue. Si le bot
+démarre déjà en train de pêcher, sans passer par le panneau, il garde cette canne,
+ou la IV s'il n'en a jamais vu.
+
+## Mode frenzy (`frenzy.bat`)
+
+```powershell
+.\frenzy.bat                 # écran 2560x1600
+.\frenzy.bat -r 1920x1080    # autre résolution
+```
+
+Un cycle sans fin, décidé d'après ce qui est à l'écran :
+
+- **« Press empty area to close »** (fin de partie) : le bot appuie sur Échap. Il en envoie
+  un second seulement si la fenêtre est encore affichée.
+- **Invite « Fishing »** du point de pêche : le bot appuie sur F.
+- **Panneau « Fishing Preparations »** : il clique sur « Start Fishing ». Il n'appuie jamais
+  sur F sur ce panneau.
+- **Sinon** : il clique près du centre de l'écran, environ deux fois par seconde.
+
+Les clics sont humains. Le point visé est un peu décalé du centre, tiré au hasard à
+chaque lancement, puis il dérive lentement. Le trajet de la souris, la durée d'appui et
+l'intervalle entre deux clics varient, avec parfois un clic rapproché ou une hésitation.
+
+L'écran est examiné tous les 3 à 6 clics, et juste après Échap, F ou « Start Fishing ».
+Échap arrête le mode frenzy, F8 le met en pause.
+
 ## Comportement humain et sessions
 
 Activé par défaut (`--robotic` pour le désactiver) :

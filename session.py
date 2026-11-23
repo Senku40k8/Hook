@@ -64,6 +64,9 @@ class Humanizer:
         self.rng = rng or random.Random()
         self.clock = clock
         self._rested_at = clock()
+        # Facteur sur les imperfections pendant la jauge (1 = normal ; plus petit =
+        # plus précis, par ex. avec une canne à pêche faible).
+        self.precision = 1.0
 
     # -- fatigue ---------------------------------------------------------------
     def rest(self) -> None:
@@ -117,7 +120,7 @@ class Humanizer:
     # -- imperfections -----------------------------------------------------------
     def skip_correction(self) -> Optional[float]:
         """Délai si cette correction doit être faite un peu en retard, sinon None."""
-        if self.cfg.enabled and self.rng.random() < self.cfg.skip_correction_chance:
+        if self.cfg.enabled and                 self.rng.random() < self.cfg.skip_correction_chance * self.precision:
             return self.rng.uniform(*self.cfg.late_correction_delay)
         return None
 
@@ -137,9 +140,10 @@ class Humanizer:
         """Multiplicateur de durée d'appui : léger bruit, parfois un dépassement."""
         if not self.cfg.enabled:
             return 1.0
-        if self.rng.random() < self.cfg.overshoot_chance:
+        if self.rng.random() < self.cfg.overshoot_chance * self.precision:
             return self.rng.uniform(*self.cfg.overshoot_factor)
-        return self.rng.uniform(0.85, 1.15)
+        noise = max(0.05, 0.15 * self.precision)
+        return self.rng.uniform(1 - noise, 1 + noise)
 
 
 # --------------------------------------------------------------------------- #

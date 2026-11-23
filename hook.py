@@ -42,6 +42,7 @@ import argparse
 import ctypes
 import json
 import logging
+import math
 import random
 import re
 import sys
@@ -135,6 +136,10 @@ class Config:
 
     # --- Régulation --------------------------------------------------------
     deadzone_ratio: float = 0.15            # tolérance autour de la cible (fraction de la largeur verte)
+    # Canne à pêche choisie (1 à 4), lue sur le panneau « Fishing Preparations » :
+    # plus elle est faible, plus le suivi est précis (voir ROD_PRECISION).
+    rod_level: int = 4
+    rods_dir: Path = TEMPLATES_DIR / "rods"
     lead_time: float = 0.15                 # anticipation du mouvement de la zone verte (s)
     velocity_smoothing: float = 0.5         # lissage de la vitesse estimée (0..1)
     press_gain: float = 0.30                # s d'appui par largeur verte d'écart (avant apprentissage)
@@ -211,8 +216,20 @@ PERSISTED_FIELDS = (
     "banner_region", "gauge_region", "regions_window",
     "green_lower", "green_upper", "yellow_lower", "yellow_upper",
     "input_backend", "window_title", "line_speed", "sell_menu_key",
-    "ui_scale_exact", "ui_scale_size", "fons_per_fish",
+    "ui_scale_exact", "ui_scale_size", "fons_per_fish", "rod_level",
 )
+
+# Précision du suivi selon la canne : (tolérance autour de la cible en fraction
+# de la zone verte, facteur sur l'intervalle entre deux corrections, facteur sur
+# les imperfections humaines : corrections en retard, appuis trop longs, bruit).
+# Toujours humain, même avec la canne la plus faible.
+ROD_PRECISION: Dict[int, Tuple[float, float, float]] = {
+    4: (0.15, 1.00, 1.00),
+    3: (0.12, 0.85, 0.70),
+    2: (0.09, 0.70, 0.50),
+    1: (0.07, 0.60, 0.35),
+}
+BASE_PRESS_COOLDOWN: Tuple[float, float] = (0.04, 0.10)
 
 
 def load_config_file(cfg: Config, path: Path) -> bool:
@@ -1869,6 +1886,40 @@ def click_area(name: str, box: Region) -> Region:
             max(1, int(w * (right - left))), max(1, int(h * (bottom - top))))
 
 
+class RodDetector:
+    """Canne à pêche affichée sur le panneau « Fishing Preparations » (templates/rods/
+    rod_1.png à rod_4.png : icône et nom). La meilleure correspondance l'emporte :
+    « Fishing Rod I » est le début de « Fishing Rod III », mais les icônes diffèrent."""
+
+    THRESHOLD = 0.85
+
+    def __init__(self, cfg: Config):
+        self.detectors = {level: BannerDetector(cfg.rods_dir / f"rod_{level}.png",
+                                                self.THRESHOLD, cfg.banner_scales)
+                          for level in ROD_PRECISION
+                          if (cfg.rods_dir / f"rod_{level}.png").exists()}
+
+    def level(self, frame: np.ndarray) -> Optional[int]:
+        # Case « Select Rod » : moitié droite, entre 50 % et 90 % de la hauteur.
+        h, w = frame.shape[:2]
+        area = frame[int(h * 0.5):int(h * 0.9), w // 2:]
+        scores = {level: det.locate(area)[0] for level, det in self.detectors.items()}
+        if not scores:
+            return None
+        best = max(scores, key=scores.get)
+        return best if scores[best] >= self.THRESHOLD else None
+
+
+def apply_rod_level(cfg: Config, level: int) -> None:
+    """Règle la précision du suivi de la jauge selon la canne (voir ROD_PRECISION)."""
+    deadzone, cooldown, imperfection = ROD_PRECISION.get(level, ROD_PRECISION[4])
+    cfg.rod_level = level
+    cfg.deadzone_ratio = deadzone
+    cfg.press_cooldown = (BASE_PRESS_COOLDOWN[0] * cooldown, BASE_PRESS_COOLDOWN[1] * cooldown)
+    if human is not None:
+        human.precision = imperfection
+
+
 class RestockFailed(Exception):
     """Un bouton du réapprovisionnement n'est pas apparu à temps."""
 
@@ -1886,6 +1937,7 @@ class Restocker:
                 name, cfg.restock_icon_threshold if icon else cfg.restock_threshold)
             self.buttons[name] = BannerDetector(
                 cfg.restock_dir / f"{name}.png", threshold, cfg.banner_scales, edges=icon)
+        self.rods = RodDetector(cfg)
         self.on_sale = None                 # rappel (Fons) à chaque vente lue
 
     def wait_for_any(self, names: Sequence[str], timeout: Optional[float] = None) -> str:
@@ -1919,6 +1971,7 @@ class Restocker:
         score, box = detector.locate(grab(region))
         if box is None or score < detector.threshold:
             return False
+        self.note_rod()
         sleep(human.reaction())
         log.info("Panneau « Fishing Preparations » : clic sur « Start Fishing ».")
         click_box((region[0] + box[0], region[1] + box[1], box[2], box[3]))
@@ -1929,7 +1982,20 @@ class Restocker:
         """True si le panneau « Fishing Preparations » est affiché (bouton « Start
         Fishing » ou case d'appât vide visible). Là, aucune touche ne fonctionne."""
         frame = grab(search_region())
-        return any(self.buttons[name].detect(frame) for name in ("start_fishing", "bait_slot_empty"))
+        if any(self.buttons[name].detect(frame) for name in ("start_fishing", "bait_slot_empty")):
+            self.note_rod(frame)
+            return True
+        return False
+
+    def note_rod(self, frame: Optional[np.ndarray] = None) -> None:
+        """Panneau affiché : lit la canne choisie et règle la précision du suivi."""
+        level = self.rods.level(grab(search_region()) if frame is None else frame)
+        if level is None or level == self.cfg.rod_level:
+            return
+        apply_rod_level(self.cfg, level)
+        log.info("Canne à pêche niveau %d : suivi de la jauge %s.", level,
+                 "normal" if level >= 4 else "plus précis")
+        remember_regions(self.cfg)
 
     def bait_missing(self) -> bool:
         """True si la case d'appât vide (« Not Selected ») est visible."""
@@ -2267,6 +2333,8 @@ class Restocker:
                 # Bouton déjà cliqué (2e « Purchase ») : surtout pas le même.
                 box = self.wait_for_button(value, avoid=before)
             clicked.setdefault(value, []).append(box)
+            if value == "start_fishing":
+                self.note_rod()
             if value == "confirm" and "quick_sell" in clicked:
                 save_sale_capture("confirm")   # montant de la vente, avant le clic
             sleep(human.reaction())       # temps de repérer le bouton apparu
@@ -2297,6 +2365,7 @@ def enter_fishing_mode(cfg: Config, prompt: Optional[BannerDetector],
             box = restocker.wait_for_button("start_fishing", timeout=2.0, quiet=True)
         except RestockFailed:
             return True                         # pas de panneau : déjà en mode pêche
+        restocker.note_rod()
         sleep(human.reaction())
         log.info("Clic sur « Start Fishing ».")
         click_box(box)
@@ -2551,6 +2620,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--invert", action="store_true", help="inverse A et D")
     p.add_argument("--input", choices=("auto", "scancode", "pyautogui"),
                    help="méthode d'envoi des touches (auto = scancode sous Windows)")
+    p.add_argument("--frenzy", action="store_true",
+                   help="mode frenzy : F, « Start Fishing », puis clics au centre (frenzy.bat)")
     p.add_argument("-v", "--verbose", action="store_true", help="logs détaillés")
     return p.parse_args(argv)
 
@@ -2717,6 +2788,132 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
             sleep(human.within((1.0, 2.0)))
 
 
+# --------------------------------------------------------------------------- #
+# Mode frenzy (frenzy.bat) : F sur l'invite, « Start Fishing », puis clics
+# --------------------------------------------------------------------------- #
+FRENZY_CLICK_INTERVAL: Range = (0.35, 0.7)   # d'un clic au suivant (≈ 2 par seconde)
+
+
+class Frenzy:
+    """Cycle sans fin, décidé à chaque tour d'après l'écran :
+    - « Press empty area to close » (fin de partie) : Échap ;
+    - panneau « Fishing Preparations » (bouton « Start Fishing ») : clic dessus ;
+    - invite « Fishing » du point de pêche : F (jamais sur le panneau) ;
+    - sinon : clic au centre de l'écran, à un rythme et un endroit variables.
+    L'écran (1 à 2 s d'analyse) est examiné au lancement, après F ou « Start
+    Fishing », puis tous les 3 à 6 clics."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.start = BannerDetector(cfg.restock_dir / "start_fishing.png",
+                                    cfg.restock_threshold, cfg.banner_scales)
+        self.prompt = fishing_prompt_detector(cfg)
+        self.close = BannerDetector(cfg.restock_dir / "rewards_close.png",
+                                    cfg.restock_threshold, cfg.banner_scales)
+        self.clicks = 0
+        self.until_check = 0                # clics avant le prochain examen de l'écran
+        # Point visé : pas tout à fait au centre (décalage tiré à chaque lancement),
+        # puis une dérive lente autour, comme une main posée sur la souris.
+        r = random.Random()
+        angle, dist = r.uniform(0, 2 * math.pi), r.uniform(0.04, 0.10)
+        self.base = (dist * math.cos(angle), dist * math.sin(angle))
+        self.drift = (0.0, 0.0)
+
+    def screen(self) -> Tuple[str, Optional[Region]]:
+        region = search_region()
+        frame = grab(region)
+        # « Start Fishing » : en bas à droite du panneau (x ≈ 79 %, y ≈ 84 %).
+        h, w = frame.shape[:2]
+        # « Press empty area to close » : en bas, au milieu (y ≈ 90 %).
+        if self.close_visible(frame):
+            return "close", None
+        x0, y0 = w // 2, int(h * 0.55)
+        score, box = self.start.locate(frame[y0:, x0:])
+        if box is not None and score >= self.start.threshold:
+            return "panel", (region[0] + x0 + box[0], region[1] + y0 + box[1], box[2], box[3])
+        if self.prompt is not None and self.prompt.detect(frame):
+            return "prompt", None
+        return "other", None
+
+    def close_visible(self, frame: Optional[np.ndarray] = None) -> bool:
+        if frame is None:
+            frame = grab(search_region())
+        h, w = frame.shape[:2]
+        return self.close.detect(frame[int(h * 0.6):, w // 4:w * 3 // 4])
+
+    def center_box(self) -> Region:
+        """Zone de clic près du centre de la fenêtre (pas pile dessus), déplacée un
+        peu à chaque fois."""
+        x, y, w, h = search_region()
+        r = human.rng
+        dx = max(-0.05, min(0.05, self.drift[0] + r.gauss(0, 0.008)))
+        dy = max(-0.05, min(0.05, self.drift[1] + r.gauss(0, 0.008)))
+        self.drift = (dx, dy)
+        ox, oy = self.base[0] + dx, self.base[1] + dy
+        if abs(ox) < 0.02 and abs(oy) < 0.02:          # jamais pile au centre
+            ox = math.copysign(0.03, ox or 1.0)
+        bw, bh = int(w * r.uniform(0.03, 0.06)), int(h * r.uniform(0.03, 0.06))
+        cx, cy = x + w * (0.5 + ox), y + h * (0.5 + oy)
+        return int(cx - bw / 2), int(cy - bh / 2), bw, bh
+
+    def step(self) -> None:
+        wait_for_focus()
+        started = time.perf_counter()
+        state, box = "other", None
+        if self.until_check <= 0:
+            state, box = self.screen()
+            self.until_check = human.rng.randint(3, 6)
+        if state != "other":
+            self.until_check = 0            # vérifier le résultat au tour suivant
+        if state == "close":
+            # Échap, vérifié : un second au plus, seulement si la fenêtre est
+            # encore là (un Échap de trop ouvrirait le menu du jeu).
+            for attempt in range(2):
+                sleep(human.within(self.cfg.escape_settle))
+                log.info("« Press empty area to close » : touche ESC%s",
+                         " (fenêtre encore affichée)" if attempt else "")
+                tap("esc", self.cfg.action_press_duration)
+                sleep(human.within((0.8, 1.2)))
+                if not self.close_visible():
+                    break
+            return
+        if state == "panel":
+            sleep(human.reaction())
+            log.info("« Start Fishing »")
+            click_box(box)
+            sleep(human.within((1.0, 1.8)))
+            return
+        if state == "prompt":
+            sleep(human.reaction())
+            log.info("Invite « Fishing » : touche %s", self.cfg.key_action.upper())
+            tap(self.cfg.key_action, self.cfg.action_press_duration)
+            sleep(human.within((1.2, 2.0)))              # ouverture du panneau
+            return
+        click_box(self.center_box())
+        self.clicks += 1
+        self.until_check -= 1
+        if self.clicks % 50 == 0:
+            log.info("%d clics.", self.clicks)
+        r = human.rng
+        pause = human.within(FRENZY_CLICK_INTERVAL)
+        if r.random() < 0.06:
+            pause = human.within((0.15, 0.25))           # clic rapproché
+        elif r.random() < 0.04:
+            pause += human.within((0.8, 2.5))            # petite hésitation
+        # Le temps passé à examiner l'écran compte dans la pause.
+        sleep(max(human.within((0.05, 0.12)), pause - (time.perf_counter() - started)))
+
+    def run(self) -> None:
+        log.info("Mode frenzy : F sur l'invite « Fishing », « Start Fishing », puis clics "
+                 "au centre (~2 par seconde). Échap : arrêt, F8 : pause.")
+        while True:
+            try:
+                self.step()
+            except ResumeRequested:
+                log.info("Reprise.")
+                sleep(human.within((1.0, 2.0)))
+
+
 _instance_mutex = None
 
 
@@ -2767,6 +2964,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   "Échap dans le jeu) avant de le relancer. Deux bots en même temps se gênent.")
         return 1
     human = Humanizer(cfg.human)
+    apply_rod_level(cfg, cfg.rod_level)     # dernière canne vue (4 par défaut)
     PAUSE_VK = cfg.pause_vk
     _pause_toggled()            # ignore un appui sur F8 antérieur au lancement
     stats = Stats(cfg.stats_path)
@@ -2806,6 +3004,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sleep(cfg.startup_countdown)
         configure_ui_scale(cfg)
         forget_stale_regions(cfg)
+        if args.frenzy:
+            Frenzy(cfg).run()
+            return 0
 
         if cfg.gauge_region is None or cfg.banner_region is None:
             log.info("Zones non mémorisées : recherche dans la fenêtre du jeu au premier "

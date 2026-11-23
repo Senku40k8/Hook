@@ -632,6 +632,125 @@ PREPARATIONS = ROOT / "templates" / "originals" / "fishing preparations.jpg"
 # --------------------------------------------------------------------------- #
 # Touche F8 (pause / reprise)
 # --------------------------------------------------------------------------- #
+@unittest.skipUnless(PREPARATIONS.exists(), "captures de référence absentes")
+class RodLevelTest(unittest.TestCase):
+    """Canne lue sur le panneau « Fishing Preparations » : plus elle est faible,
+    plus le suivi est précis (tolérance, rythme des corrections, imperfections)."""
+
+    def setUp(self):
+        self.saved = (hook.human, hook.UI.candidates, hook.UI.locked, hook.UI.on_lock)
+        hook.human = Humanizer(HumanConfig())
+        hook.UI.on_lock = None
+
+    def tearDown(self):
+        hook.human, hook.UI.candidates, hook.UI.locked, hook.UI.on_lock = self.saved
+
+    def test_rod_read_on_real_panel_at_several_scales(self):
+        img = cv2.imread(str(PREPARATIONS))                  # Fishing Rod III
+        for k, size in ((1.0, (2560, 1600)), (0.675, (1728, 1080))):
+            hook.UI.configure(*size)
+            frame = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+            self.assertEqual(hook.RodDetector(hook.Config()).level(frame), 3, size)
+
+    def test_each_rod_recognised_and_nothing_elsewhere(self):
+        hook.UI.configure(2560, 1600)
+        rods = hook.RodDetector(hook.Config())
+        for level in (1, 2, 3, 4):
+            frame = np.full((1600, 2560, 3), 40, np.uint8)
+            tpl = cv2.imread(str(ROOT / "templates" / "rods" / f"rod_{level}.png"))
+            frame[1000:1000 + tpl.shape[0], 1800:1800 + tpl.shape[1]] = tpl
+            self.assertEqual(rods.level(frame), level)
+        self.assertIsNone(rods.level(cv2.imread(str(ROOT / "templates" / "originals" / "rewards.jpg"))))
+
+    def test_weaker_rod_means_more_precise_but_still_human(self):
+        cfg = hook.Config()
+        settings = {}
+        for level in (4, 3, 2, 1):
+            hook.apply_rod_level(cfg, level)
+            settings[level] = (cfg.deadzone_ratio, cfg.press_cooldown[1], hook.human.precision)
+        for a, b in ((4, 3), (3, 2), (2, 1)):
+            self.assertTrue(all(x > y for x, y in zip(settings[a], settings[b])), (a, b))
+        self.assertEqual(settings[4], (0.15, 0.10, 1.0))           # niveau 4 : inchangé
+        self.assertGreater(hook.human.precision, 0)                # toujours des imperfections
+        factors = {round(hook.human.press_factor(), 3) for _ in range(50)}
+        self.assertGreater(len(factors), 10)                        # appuis toujours variés
+
+
+@unittest.skipUnless(PREPARATIONS.exists(), "captures de référence absentes")
+class FrenzyTest(unittest.TestCase):
+    """frenzy.bat : panneau -> clic « Start Fishing » (pas F), invite « Fishing » -> F,
+    sinon clic près du centre (jamais pile dessus), à environ 2 clics par seconde."""
+
+    def setUp(self):
+        self.saved = (hook.grab, hook.search_region, hook.click_box, hook.tap,
+                      hook.sleep, hook.human, hook.target)
+        self.events, self.waited = [], []
+        hook.search_region = lambda: (0, 0, 2560, 1600)
+        hook.click_box = lambda box: self.events.append(("click", box))
+        hook.tap = lambda key, d: self.events.append(("key", key))
+        hook.sleep = lambda s: self.waited.append(s)
+        hook.human = Humanizer(HumanConfig())
+        hook.target = None
+
+    def tearDown(self):
+        (hook.grab, hook.search_region, hook.click_box, hook.tap,
+         hook.sleep, hook.human, hook.target) = self.saved
+
+    def run_on(self, frame):
+        hook.grab = lambda region=None: frame
+        frenzy = hook.Frenzy(hook.Config())
+        self.events.clear()
+        frenzy.step()
+        return frenzy
+
+    def test_panel_clicks_start_fishing_without_f(self):
+        self.run_on(cv2.imread(str(PREPARATIONS)))
+        self.assertEqual(len(self.events), 1)
+        kind, (x, y, w, h) = self.events[0]
+        self.assertEqual(kind, "click")
+        self.assertGreater(x, 1280)                 # bouton en bas à droite du panneau
+
+    def test_close_banner_is_dismissed_first(self):
+        """« Press empty area to close » (vraie capture) : Échap (un second seulement
+        si la fenêtre reste) ; au tour suivant, l'écran est réexaminé (puis « Start
+        Fishing »)."""
+        frames = [cv2.imread(str(ROOT / "templates" / "originals" / "rewards.jpg"))]
+        hook.grab = lambda region=None: frames[0]
+        frenzy = hook.Frenzy(hook.Config())
+        hook.tap = lambda key, d: (self.events.append(("key", key)),
+                                   frames.__setitem__(0, np.full((1600, 2560, 3), 60, np.uint8)))
+        frenzy.step()
+        self.assertEqual(self.events, [("key", "esc")])           # fermée au premier Échap
+        self.assertEqual(frenzy.until_check, 0)
+        hook.grab = lambda region=None: cv2.imread(str(PREPARATIONS))
+        frenzy.step()
+        self.assertEqual(self.events[-1][0], "click")              # Start Fishing
+
+    def test_prompt_presses_f(self):
+        frame = np.full((1600, 2560, 3), 60, np.uint8)
+        prompt = cv2.imread(str(ROOT / "templates" / "fishing_prompt.png"))
+        frame[900:900 + prompt.shape[0], 1500:1500 + prompt.shape[1]] = prompt
+        self.run_on(frame)
+        self.assertEqual(self.events, [("key", "f")])
+
+    def test_clicks_near_but_not_at_center(self):
+        frame = np.full((1600, 2560, 3), 60, np.uint8)
+        hook.grab = lambda region=None: frame
+        frenzy = hook.Frenzy(hook.Config())
+        for _ in range(200):
+            self.waited.clear()
+            frenzy.step()
+        clicks = [e[1] for e in self.events]
+        self.assertEqual(len(clicks), 200)
+        centers = [(x + w / 2, y + h / 2) for x, y, w, h in clicks]
+        for cx, cy in centers:
+            self.assertLess(abs(cx - 1280), 2560 * 0.16)
+            self.assertLess(abs(cy - 800), 1600 * 0.16)
+        off = [max(abs(cx - 1280) / 2560, abs(cy - 800) / 1600) for cx, cy in centers]
+        self.assertGreater(min(off), 0.015)          # jamais pile au centre
+        self.assertGreater(len({c for c in clicks}), 150)   # endroits variés
+
+
 class PauseKeyTest(unittest.TestCase):
     """Simule GetAsyncKeyState : 0x8000 = F8 enfoncée, 0x0001 = pressée depuis la
     dernière lecture."""
