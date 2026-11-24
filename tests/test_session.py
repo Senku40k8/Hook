@@ -727,38 +727,159 @@ class FrenzyTest(unittest.TestCase):
         frenzy.step()
         self.assertEqual(self.events[-1][0], "click")              # Start Fishing
 
-    def test_net_presses_w_then_one_click_every_5_5_s(self):
-        """Filet affiché : W une fois, puis un clic toutes les ~5,5 s jusqu'à la fin
-        de la partie (Échap) ; la partie suivante repart sans filet."""
-        frame = np.full((1600, 2560, 3), 60, np.uint8)
-        net = cv2.imread(str(ROOT / "templates" / "originals" / "net.png"))
-        frame[1150:1150 + net.shape[0], 1200:1200 + net.shape[1]] = net
+    # --- Outils (filet, bombe) : temps simulé ------------------------------------
+    @staticmethod
+    def game_frame(tools, size=(2560, 1600)):
+        """Écran de partie avec les icônes des outils (vraies captures, à l'échelle
+        de l'interface pour cette résolution : 0,675 en 1920×1080)."""
+        w, h = size
+        frame = np.full((h, w, 3), 60, np.uint8)
+        scale = h / 1600
+        x = int(w * 0.45)
+        for tool in tools:
+            icon = cv2.imread(str(ROOT / "templates" / "originals" / f"{tool}.png"))
+            if scale != 1:
+                icon = cv2.resize(icon, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            y = int(h * 0.72)
+            frame[y:y + icon.shape[0], x:x + icon.shape[1]] = icon
+            x += icon.shape[1] + int(40 * scale)
+        return frame
+
+    def play(self, frame, seconds):
+        """Fait tourner le mode frenzy sur `frame` pendant `seconds` secondes de
+        temps simulé. Renvoie le Frenzy et les événements horodatés."""
+        now = [1000.0]
+        hook.sleep = lambda s: now.__setitem__(0, now[0] + s)
+        hook.click_box = lambda box: self.events.append((now[0], "click", None))
+        hook.tap = lambda key, d: self.events.append((now[0], "key", key))
         hook.grab = lambda region=None: frame
         frenzy = hook.Frenzy(hook.Config())
-        frenzy.step()
-        self.assertTrue(5 <= len(self.events) <= 8, self.events)     # W plusieurs fois
-        self.assertEqual(set(self.events), {("key", hook.FRENZY_NET_KEY)})
+        frenzy.clock = lambda: now[0]
+        frenzy.started_at = now[0]
+        self.events.clear()
+        while now[0] < 1000.0 + seconds:
+            frenzy.step()
+        return frenzy
+
+    def throws(self):
+        """(instant, outil) de chaque lancer : un clic, l'outil étant celui de la
+        dernière touche W/E envoyée."""
+        out, selected = [], None
+        names = {key: tool for tool, (key, _, _) in hook.FRENZY_TOOLS.items()}
+        for when, kind, key in self.events:
+            if kind == "key":
+                selected = names[key]
+            else:
+                out.append((when, selected))
+        return out
+
+    def check_cooldowns(self, throws):
+        for tool, (_, cooldown, _) in hook.FRENZY_TOOLS.items():
+            times = [w for w, t in throws if t == tool]
+            gaps = [b - a for a, b in zip(times, times[1:])]
+            # Jamais avant la fin du temps de recharge ; jamais beaucoup plus.
+            self.assertTrue(all(cooldown + 0.29 < g < cooldown + 3.0 for g in gaps),
+                            (tool, gaps))
+        moments = [w for w, _ in throws]
+        self.assertTrue(all(b - a >= 0.79 for a, b in zip(moments, moments[1:])), moments)
+
+    def test_net_alone_w_then_one_click_after_each_cooldown(self):
+        """Filet seul : W plusieurs fois (l'outil n'est pas toujours prenable tout
+        de suite), puis un clic à chaque fin de recharge (5 s + 0,3 à 1 s), sans
+        rappuyer sur W ; fin de partie : Échap, et la suivante repart sans filet."""
+        frenzy = self.play(self.game_frame(["net"]), 60)
+        keys = [k for _, kind, k in self.events if kind == "key"]
+        self.assertTrue(5 <= len(keys) <= 8, keys)
+        self.assertEqual(set(keys), {hook.FRENZY_TOOLS["net"][0]})
+        self.assertEqual([kind for _, kind, _ in self.events[len(keys):]],
+                         ["click"] * (len(self.events) - len(keys)))
+        throws = self.throws()
+        self.assertGreaterEqual(len(throws), 9)
+        self.check_cooldowns(throws)
+        gaps = [b[0] - a[0] for a, b in zip(throws, throws[1:])]
+        self.assertTrue(all(5.3 <= g <= 6.0 for g in gaps), gaps)
+        self.assertGreater(len({round(g, 2) for g in gaps}), len(gaps) // 2)   # irrégulier
         self.assertTrue(frenzy.net_mode)
-        self.events[:] = [("key", hook.FRENZY_NET_KEY)]
-        pauses = []
-        for _ in range(30):
-            self.waited.clear()
-            t0 = time.perf_counter()
-            frenzy.step()                       # filet toujours visible : pas de second W
-            # Intervalle d'un clic au suivant : temps d'analyse + pause restante.
-            pauses.append(time.perf_counter() - t0 + self.waited[-1])
-        self.assertEqual([e[0] for e in self.events[1:]], ["click"] * 30)
-        self.assertTrue(all(4.5 < p < 6.7 for p in pauses), pauses)
-        self.assertAlmostEqual(sum(pauses) / len(pauses), 5.5, delta=0.35)
-        self.assertGreater(len({round(p, 2) for p in pauses}), 20)      # jamais régulier
         frenzy.until_check = 0
         hook.grab = lambda region=None: cv2.imread(
             str(ROOT / "templates" / "originals" / "rewards.jpg"))
-        hook.tap = lambda key, d: (self.events.append(("key", key)),
-                                   setattr(hook, "grab", lambda region=None: frame * 0 + 60))
+        hook.tap = lambda key, d: (self.events.append((0, "key", key)),
+                                   setattr(hook, "grab", lambda region=None:
+                                           np.full((1600, 2560, 3), 60, np.uint8)))
         frenzy.step()
-        self.assertEqual(self.events[-1], ("key", "esc"))
+        self.assertEqual(self.events[-1][1:], ("key", "esc"))
         self.assertFalse(frenzy.net_mode)
+
+    def check_net_and_bomb(self, size):
+        frenzy = self.play(self.game_frame(["net", "bomb"], size), 90)
+        self.assertEqual(frenzy.tools, ["net", "bomb"])
+        throws = self.throws()
+        self.assertGreaterEqual(len(throws), 12)
+        tools = [t for _, t in throws]
+        self.assertEqual(tools, (["net", "net", "bomb"] * 20)[:len(tools)])
+        self.check_cooldowns(throws)
+        # Touche de l'outil seulement quand il change : W avant le filet qui suit
+        # une bombe, E avant chaque bombe, rien entre deux filets.
+        w, e = hook.FRENZY_TOOLS["net"][0], hook.FRENZY_TOOLS["bomb"][0]
+        before, keys = [], []
+        for _, kind, key in self.events:
+            if kind == "key":
+                keys.append(key)
+            else:
+                before.append(keys)
+                keys = []
+        self.assertTrue(5 <= len(before[0]) <= 8 and set(before[0]) == {w}, before[0])
+        for i, ks in enumerate(before[1:], 1):
+            changed = tools[i] != tools[i - 1]
+            expected = {e} if tools[i] == "bomb" else {w}
+            if changed:
+                self.assertTrue(1 <= len(ks) <= 3 and set(ks) == expected, (i, ks))
+            else:
+                self.assertEqual(ks, [], i)
+
+    def test_net_and_bomb_cycle_two_nets_one_bomb(self):
+        """Filet et bombe : deux filets, une bombe, etc. ; chaque outil après sa
+        recharge (5 s filet, 10 s bombe) plus une marge aléatoire."""
+        self.check_net_and_bomb((2560, 1600))
+
+    def test_net_and_bomb_cycle_in_1920x1080(self):
+        hook.search_region = lambda: (0, 0, 1920, 1080)
+        hook.UI.configure(1920, 1080)
+        try:
+            self.check_net_and_bomb((1920, 1080))
+        finally:
+            hook.UI.configure(2560, 1600)
+
+    def test_bomb_seen_later_joins_the_cycle(self):
+        """Bombe vue après le filet (débloquée en cours de partie) : elle rejoint le
+        cycle, sans lancer avant la fin des recharges."""
+        frames = [self.game_frame(["net"])]
+        now = [1000.0]
+        hook.sleep = lambda s: now.__setitem__(0, now[0] + s)
+        hook.click_box = lambda box: self.events.append((now[0], "click", None))
+        hook.tap = lambda key, d: self.events.append((now[0], "key", key))
+        hook.grab = lambda region=None: frames[0]
+        frenzy = hook.Frenzy(hook.Config())
+        frenzy.clock = lambda: now[0]
+        self.events.clear()
+        while now[0] < 1020:
+            frenzy.step()
+        frames[0] = self.game_frame(["net", "bomb"])
+        while now[0] < 1080:
+            frenzy.step()
+        self.assertEqual(frenzy.tools, ["net", "bomb"])
+        throws = self.throws()
+        self.assertIn("bomb", [t for _, t in throws])
+        self.check_cooldowns(throws)
+
+    def test_tool_icons_not_seen_elsewhere(self):
+        """Ni filet ni bombe sur les autres écrans (panneau, fin de partie, vente)."""
+        frenzy = hook.Frenzy(hook.Config())
+        for name in ("fishing preparations.jpg", "rewards.jpg", "sale rewards.jpg",
+                     "quick sell confirm.jpg", "switch bait stock.jpg", "gauge forest.png"):
+            frame = cv2.imread(str(ROOT / "templates" / "originals" / name))
+            for tool, det in frenzy.tool_icons.items():
+                self.assertFalse(det.detect(frame), (tool, name))
 
     @unittest.skipUnless(sys.platform == "win32", "Windows uniquement")
     def test_net_key_is_the_key_labelled_w(self):

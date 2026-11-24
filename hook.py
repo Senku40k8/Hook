@@ -2825,8 +2825,17 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
 # Mode frenzy (frenzy.bat) : F sur l'invite, « Start Fishing », puis clics
 # --------------------------------------------------------------------------- #
 FRENZY_CLICK_INTERVAL: Range = (0.35, 0.7)   # d'un clic au suivant (≈ 2 par seconde)
-FRENZY_NET_INTERVAL = 5.5                     # avec le filet : un clic toutes les ~5,5 s
-FRENZY_NET_KEY = CHAR_KEY + "w"               # la touche marquée W, même en AZERTY
+# Outils de la partie : la touche les sélectionne, un clic les lance. Touches
+# prises par la lettre marquée dessus (W en bas à gauche en AZERTY). Temps de
+# recharge exacts (donnés par le jeu), auxquels s'ajoute une marge aléatoire.
+FRENZY_TOOLS = {
+    "net": (CHAR_KEY + "w", 5.0, "filet"),
+    "bomb": (CHAR_KEY + "e", 10.0, "bombe"),
+}
+FRENZY_NET_KEY = FRENZY_TOOLS["net"][0]
+FRENZY_TOOL_MARGIN: Range = (0.3, 1.0)        # en plus du temps de recharge
+FRENZY_TOOL_GAP: Range = (0.8, 1.5)           # au moins entre deux lancers
+FRENZY_CYCLE = ("net", "net", "bomb")         # deux filets, une bombe
 
 
 class Frenzy:
@@ -2834,12 +2843,16 @@ class Frenzy:
     - « Press empty area to close » (fin de partie) : Échap ;
     - panneau « Fishing Preparations » (bouton « Start Fishing ») : clic dessus ;
     - invite « Fishing » du point de pêche : F (jamais sur le panneau) ;
-    - filet visible (templates/frenzy/net.png) : W, puis jusqu'à la fin de la
-      partie, un seul clic toutes les ~5,5 s ;
+    - filet (templates/frenzy/net.png) ou bombe (templates/frenzy/bomb.png)
+      visible : plus de clics rapides jusqu'à la fin de la partie, seulement des
+      lancers. Lancer = touche de l'outil (W filet, E bombe ; seulement si un
+      autre outil était sélectionné) puis un clic. Avec les deux : deux filets,
+      une bombe, et ainsi de suite, chaque outil après son temps de recharge
+      (5 s filet, 10 s bombe) plus une marge aléatoire ;
     - sinon : clic au centre de l'écran, à un rythme et un endroit variables.
     L'écran (0,1 à 0,3 s d'analyse) est examiné au lancement, après chaque action,
-    à chaque clic pendant les 4 premières secondes d'une partie et avec le filet,
-    sinon tous les 3 à 6 clics."""
+    à chaque clic pendant les 4 premières secondes d'une partie et avec les
+    outils, sinon tous les 3 à 6 clics."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -2848,9 +2861,14 @@ class Frenzy:
         self.prompt = fishing_prompt_detector(cfg)
         self.close = BannerDetector(cfg.restock_dir / "rewards_close.png",
                                     cfg.restock_threshold, cfg.banner_scales)
-        net = cfg.templates_dir / "frenzy" / "net.png"
-        self.net = BannerDetector(net, cfg.restock_threshold, cfg.banner_scales)             if net.exists() else None
-        self.net_mode = False               # filet lancé : un clic toutes les ~5,5 s
+        self.tool_icons: Dict[str, BannerDetector] = {}
+        for tool in FRENZY_TOOLS:
+            path = cfg.templates_dir / "frenzy" / f"{tool}.png"
+            if path.exists():
+                self.tool_icons[tool] = BannerDetector(path, cfg.restock_threshold,
+                                                       cfg.banner_scales)
+        self.clock = time.perf_counter
+        self.reset_tools()
         self.started_at = 0.0               # dernier « Start Fishing »
         self.clicks = 0
         self.until_check = 0                # clics avant le prochain examen de l'écran
@@ -2860,6 +2878,54 @@ class Frenzy:
         angle, dist = r.uniform(0, 2 * math.pi), r.uniform(0.04, 0.10)
         self.base = (dist * math.cos(angle), dist * math.sin(angle))
         self.drift = (0.0, 0.0)
+
+    def reset_tools(self) -> None:
+        """Nouvelle partie : outils à revoir à l'écran."""
+        self.tools: List[str] = []          # outils vus dans cette partie
+        self.found: List[str] = []          # outils vus au dernier examen
+        self.selected: Optional[str] = None
+        self.last_throw: Dict[str, float] = {}
+        self.cycle_pos = 0
+        self.ready_at = 0.0                 # prochain lancer possible
+
+    @property
+    def net_mode(self) -> bool:
+        return bool(self.tools)
+
+    def pattern(self) -> List[str]:
+        return [t for t in FRENZY_CYCLE if t in self.tools] or list(self.tools)
+
+    def schedule(self) -> None:
+        """Instant du prochain lancer : temps de recharge de l'outil suivant (plus
+        une marge aléatoire), et un petit écart après le lancer précédent."""
+        tool = self.pattern()[self.cycle_pos % len(self.pattern())]
+        cooldown = FRENZY_TOOLS[tool][1]
+        ready = self.last_throw.get(tool, -1e9) + cooldown + human.within(FRENZY_TOOL_MARGIN)
+        last = max(self.last_throw.values(), default=-1e9)
+        self.ready_at = max(ready, last + human.within(FRENZY_TOOL_GAP))
+
+    def throw(self) -> None:
+        """Lance l'outil suivant du cycle s'il est prêt, sinon attend un peu."""
+        wait = self.ready_at - self.clock()
+        if wait > 1.0:
+            sleep(min(wait - 0.9, human.within((0.5, 0.9))))   # écran réexaminé entre-temps
+            return
+        if wait > 0:
+            sleep(wait)                     # dernier instant : sans examen (0,3 à 0,5 s)
+        tool = self.pattern()[self.cycle_pos % len(self.pattern())]
+        key, _, label = FRENZY_TOOLS[tool]
+        if self.selected != tool:
+            for _ in range(human.rng.randint(2, 3)):
+                tap(key, self.cfg.action_press_duration)
+                sleep(human.within((0.12, 0.25)))
+            self.selected = tool
+            sleep(human.within((0.1, 0.25)))
+        click_box(self.center_box())
+        self.last_throw[tool] = self.clock()
+        self.cycle_pos += 1
+        log.info("%s lancé%s.", label.capitalize(), "e" if tool == "bomb" else "")
+        self.schedule()
+        sleep(human.within((0.15, 0.3)))
 
     def screen(self) -> Tuple[str, Optional[Region]]:
         region = search_region()
@@ -2875,8 +2941,10 @@ class Frenzy:
             return "panel", (region[0] + x0 + box[0], region[1] + y0 + box[1], box[2], box[3])
         if self.prompt is not None and self.prompt.detect(frame):
             return "prompt", None
-        if not self.net_mode and self.net is not None and self.net.detect(frame):
-            return "net", None
+        self.found = [t for t, det in self.tool_icons.items()
+                      if t not in self.tools and det.detect(frame)]
+        if self.found:
+            return "tools", None
         return "other", None
 
     def close_visible(self, frame: Optional[np.ndarray] = None) -> bool:
@@ -2902,7 +2970,7 @@ class Frenzy:
 
     def step(self) -> None:
         wait_for_focus()
-        started = time.perf_counter()
+        started = self.clock()
         state, box = "other", None
         if self.until_check <= 0:
             state, box = self.screen()
@@ -2910,18 +2978,33 @@ class Frenzy:
         if state != "other":
             self.until_check = 0            # vérifier le résultat au tour suivant
         if state in ("close", "panel"):
-            self.net_mode = False           # partie terminée : le filet est à revoir
-        if state == "net":
-            sleep(human.reaction())
-            log.info("Filet affiché : touche %s plusieurs fois, puis un clic toutes les ~%.1f s.",
-                     layout_char(FRENZY_NET_KEY).upper(), FRENZY_NET_INTERVAL)
-            # Plusieurs W espacés (sur ~2 à 4 s) : le filet n'est pas toujours
-            # prenable dès que son icône apparaît.
-            for _ in range(human.rng.randint(5, 8)):
-                tap(FRENZY_NET_KEY, self.cfg.action_press_duration)
-                sleep(human.within((0.3, 0.6)))
-            self.net_mode = True
-            sleep(human.within((0.6, 1.2)))
+            self.reset_tools()              # partie terminée : outils à revoir
+        if state == "tools":
+            first = not self.tools
+            self.tools += self.found
+            self.tools.sort(key=list(FRENZY_TOOLS).index)
+            for tool in self.found:
+                key, cooldown, label = FRENZY_TOOLS[tool]
+                log.info("%s affiché%s : touche %s puis clic, toutes les %.0f s et un peu plus.",
+                         label.capitalize(), "e" if tool == "bomb" else "",
+                         layout_char(key).upper(), cooldown)
+            if len(self.tools) > 1:
+                log.info("Cycle : %s.", ", ".join(FRENZY_TOOLS[t][2] for t in self.pattern()))
+            self.cycle_pos = 0
+            if first:
+                # Premier outil de la partie : sa touche plusieurs fois (sur 2 à
+                # 4 s), il n'est pas toujours prenable dès que son icône apparaît.
+                sleep(human.reaction())
+                tool = self.pattern()[0]
+                for _ in range(human.rng.randint(5, 8)):
+                    tap(FRENZY_TOOLS[tool][0], self.cfg.action_press_duration)
+                    sleep(human.within((0.3, 0.6)))
+                self.selected = tool
+            self.schedule()
+            return
+        if self.tools:
+            self.until_check = 0            # outils : écran examiné à chaque tour
+            self.throw()
             return
         if state == "close":
             # Échap, vérifié : un second au plus, seulement si la fenêtre est
@@ -2939,7 +3022,7 @@ class Frenzy:
             sleep(human.reaction())
             log.info("« Start Fishing »")
             click_box(box)
-            self.started_at = time.perf_counter()
+            self.started_at = self.clock()
             sleep(human.within((1.0, 1.8)))
             return
         if state == "prompt":
@@ -2951,21 +3034,18 @@ class Frenzy:
         click_box(self.center_box())
         self.clicks += 1
         self.until_check -= 1
-        if self.net_mode or time.perf_counter() - self.started_at < 4.0:
-            self.until_check = 0            # début de partie (filet ?) ou filet lancé
+        if self.clock() - self.started_at < 4.0:
+            self.until_check = 0            # début de partie : outils ?
         if self.clicks % 50 == 0:
             log.info("%d clics.", self.clicks)
         r = human.rng
-        if self.net_mode:
-            pause = max(4.6, min(6.6, r.gauss(FRENZY_NET_INTERVAL, 0.4)))
-        else:
-            pause = human.within(FRENZY_CLICK_INTERVAL)
-            if r.random() < 0.06:
-                pause = human.within((0.15, 0.25))       # clic rapproché
-            elif r.random() < 0.04:
-                pause += human.within((0.8, 2.5))        # petite hésitation
+        pause = human.within(FRENZY_CLICK_INTERVAL)
+        if r.random() < 0.06:
+            pause = human.within((0.15, 0.25))           # clic rapproché
+        elif r.random() < 0.04:
+            pause += human.within((0.8, 2.5))            # petite hésitation
         # Le temps passé à examiner l'écran compte dans la pause.
-        sleep(max(human.within((0.05, 0.12)), pause - (time.perf_counter() - started)))
+        sleep(max(human.within((0.05, 0.12)), pause - (self.clock() - started)))
 
     def run(self) -> None:
         log.info("Mode frenzy : F sur l'invite « Fishing », « Start Fishing », puis clics "
@@ -3052,7 +3132,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         keyboard = make_keyboard(cfg.input_backend)
         keyboard.prepare((cfg.key_action, cfg.key_left, cfg.key_right, cfg.bait_menu_key, "q", "esc",
-                          FRENZY_NET_KEY))
+                          *(key for key, _, _ in FRENZY_TOOLS.values())))
         log.info("Envoi des touches : %s", keyboard.name)
 
         banner = BannerDetector(cfg.banner_template, cfg.banner_threshold, cfg.banner_scales)

@@ -125,11 +125,17 @@ Un cycle sans fin, décidé d'après ce qui est à l'écran :
 - **Invite « Fishing »** du point de pêche : le bot appuie sur F.
 - **Panneau « Fishing Preparations »** : il clique sur « Start Fishing ». Il n'appuie jamais
   sur F sur ce panneau.
-- **Filet affiché** (icône du filet avec W) : il appuie 5 à 8 fois sur la touche marquée W
-  du clavier, sur 2 à 4 s. C'est la touche marquée W même en AZERTY (en bas à gauche),
-  contrairement aux autres touches du jeu, prises par leur position QWERTY. Jusqu'à la fin
-  de la partie, il ne clique ensuite qu'une fois toutes les 5,5 s environ, puis le cycle
-  reprend (Échap, « Start Fishing »…).
+- **Filet ou bombe affichés** (icônes avec W et E) : plus de clics rapides jusqu'à la fin
+  de la partie, seulement des lancers. Un lancer = la touche de l'outil, puis un clic. Les
+  touches sont celles marquées W et E sur le clavier, même en AZERTY (W en bas à gauche).
+  - Filet seul : W plusieurs fois au début (5 à 8 fois sur 2 à 4 s), puis un clic à chaque
+    fin de recharge (5 s, plus 0,3 à 1 s au hasard).
+  - Filet et bombe (bombe débloquée) : deux filets, une bombe, deux filets, etc. Chaque
+    outil n'est relancé qu'après son temps de recharge (5 s filet, 10 s bombe), plus 0,3 à
+    1 s au hasard. La touche n'est envoyée que quand l'outil change (E avant chaque bombe,
+    W avant le filet qui la suit).
+  - Une bombe débloquée en cours de partie rejoint le cycle dès qu'elle est vue.
+  - À la fin de la partie : Échap, « Start Fishing », et le cycle reprend.
 - **Sinon** : il clique près du centre de l'écran, environ deux fois par seconde.
 
 Les clics sont humains. Le point visé est un peu décalé du centre, tiré au hasard à
@@ -137,7 +143,7 @@ chaque lancement, puis il dérive lentement. Le trajet de la souris, la durée d
 l'intervalle entre deux clics varient, avec parfois un clic rapproché ou une hésitation.
 
 L'écran est examiné juste après chaque action, à chaque clic pendant les 4 premières
-secondes d'une partie et avec le filet, sinon tous les 3 à 6 clics.
+secondes d'une partie et avec les outils, sinon tous les 3 à 6 clics.
 Échap arrête le mode frenzy, F8 le met en pause.
 
 ## Comportement humain et sessions
