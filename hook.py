@@ -426,9 +426,34 @@ GAME_SCANCODES = {
 }
 
 
+# Touche désignée par la lettre marquée dessus, pas par sa position : "char:w" est
+# la touche marquée W du clavier, où qu'elle soit (en bas à gauche en AZERTY).
+# Le jeu attend ainsi la touche du filet (vérifié en jeu, clavier AZERTY).
+CHAR_KEY = "char:"
+
+
+def layout_scancode(ch: str) -> Optional[int]:
+    """Scancode de la touche marquée `ch` dans la disposition Windows active
+    ("w" -> 0x2C en AZERTY, 0x11 en QWERTY), None si introuvable."""
+    if sys.platform != "win32" or len(ch) != 1:
+        return None
+    u32 = ctypes.WinDLL("user32")
+    u32.VkKeyScanW.argtypes = [ctypes.c_wchar]
+    u32.VkKeyScanW.restype = ctypes.c_short
+    u32.MapVirtualKeyW.argtypes = [ctypes.c_uint, ctypes.c_uint]
+    u32.MapVirtualKeyW.restype = ctypes.c_uint
+    res = u32.VkKeyScanW(ch)
+    if res == -1:
+        return None
+    code = u32.MapVirtualKeyW(res & 0xFF, 0)         # MAPVK_VK_TO_VSC
+    return code or None
+
+
 def layout_char(key: str) -> str:
     """Caractère de la disposition Windows active pour la touche du jeu `key`
     (ex. "a" -> "q" en AZERTY). Sert au mode PyAutoGUI (touches virtuelles)."""
+    if key.lower().startswith(CHAR_KEY):
+        return key[len(CHAR_KEY):].lower()
     code = GAME_SCANCODES.get(key.lower())
     if sys.platform != "win32" or code is None or len(key) != 1:
         return key
@@ -506,6 +531,10 @@ class ScancodeKeyboard:
         self._u32 = u32
 
     def scancode(self, key: str) -> int:
+        if key.lower().startswith(CHAR_KEY):
+            ch = key[len(CHAR_KEY):].lower()
+            code = layout_scancode(ch)
+            return code if code is not None else GAME_SCANCODES[ch]
         code = GAME_SCANCODES.get(key.lower())
         if code is None:
             raise ValueError(f"Touche non gérée en mode scancode : {key!r}")
@@ -513,6 +542,10 @@ class ScancodeKeyboard:
 
     def prepare(self, keys: Sequence[str]) -> None:
         for key in keys:
+            if key.lower().startswith(CHAR_KEY):
+                log.debug("Touche marquée %s -> scancode 0x%02X",
+                          layout_char(key).upper(), self.scancode(key))
+                continue
             log.debug("Touche %s du jeu -> scancode 0x%02X (touche %s de ce clavier)",
                       key.upper(), self.scancode(key), layout_char(key).upper())
 
@@ -2793,7 +2826,7 @@ def run_loop(cfg: Config, args: argparse.Namespace, banner: BannerDetector,
 # --------------------------------------------------------------------------- #
 FRENZY_CLICK_INTERVAL: Range = (0.35, 0.7)   # d'un clic au suivant (≈ 2 par seconde)
 FRENZY_NET_INTERVAL = 5.5                     # avec le filet : un clic toutes les ~5,5 s
-FRENZY_NET_KEY = "w"                          # touche W du jeu (Z sur un clavier AZERTY)
+FRENZY_NET_KEY = CHAR_KEY + "w"               # la touche marquée W, même en AZERTY
 
 
 class Frenzy:

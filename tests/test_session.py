@@ -737,9 +737,9 @@ class FrenzyTest(unittest.TestCase):
         frenzy = hook.Frenzy(hook.Config())
         frenzy.step()
         self.assertTrue(5 <= len(self.events) <= 8, self.events)     # W plusieurs fois
-        self.assertEqual(set(self.events), {("key", "w")})
+        self.assertEqual(set(self.events), {("key", hook.FRENZY_NET_KEY)})
         self.assertTrue(frenzy.net_mode)
-        self.events[:] = [("key", "w")]
+        self.events[:] = [("key", hook.FRENZY_NET_KEY)]
         pauses = []
         for _ in range(30):
             self.waited.clear()
@@ -759,6 +759,16 @@ class FrenzyTest(unittest.TestCase):
         frenzy.step()
         self.assertEqual(self.events[-1], ("key", "esc"))
         self.assertFalse(frenzy.net_mode)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows uniquement")
+    def test_net_key_is_the_key_labelled_w(self):
+        """Le filet se prend avec la touche marquée W du clavier (en bas à gauche en
+        AZERTY, scancode 0x2C), pas la position QWERTY du W (marquée Z en AZERTY)."""
+        import ctypes
+        code = hook.ScancodeKeyboard().scancode(hook.FRENZY_NET_KEY)
+        vk = ctypes.WinDLL("user32").MapVirtualKeyW(code, 1)       # MAPVK_VSC_TO_VK
+        self.assertEqual(vk, ord("W"))
+        self.assertEqual(_saved_inputs[2](hook.FRENZY_NET_KEY), "w")
 
     def test_prompt_presses_f(self):
         frame = np.full((1600, 2560, 3), 60, np.uint8)
