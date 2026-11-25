@@ -873,13 +873,84 @@ class FrenzyTest(unittest.TestCase):
         self.check_cooldowns(throws)
 
     def test_tool_icons_not_seen_elsewhere(self):
-        """Ni filet ni bombe sur les autres écrans (panneau, fin de partie, vente)."""
+        """Ni filet, ni bombe, ni « fish pond is empty » sur les autres écrans
+        (panneau, fin de partie, vente, partie avec les outils)."""
         frenzy = hook.Frenzy(hook.Config())
-        for name in ("fishing preparations.jpg", "rewards.jpg", "sale rewards.jpg",
-                     "quick sell confirm.jpg", "switch bait stock.jpg", "gauge forest.png"):
-            frame = cv2.imread(str(ROOT / "templates" / "originals" / name))
-            for tool, det in frenzy.tool_icons.items():
-                self.assertFalse(det.detect(frame), (tool, name))
+        dets = dict(frenzy.tool_icons, pond=frenzy.pond)
+        frames = {name: cv2.imread(str(ROOT / "templates" / "originals" / name))
+                  for name in ("fishing preparations.jpg", "rewards.jpg", "sale rewards.jpg",
+                               "quick sell confirm.jpg", "switch bait stock.jpg",
+                               "gauge forest.png")}
+        frames["outils"] = self.game_frame(["net", "bomb"])
+        for name, frame in frames.items():
+            for what, det in dets.items():
+                if not (name == "outils" and what != "pond"):
+                    self.assertFalse(det.detect(frame), (what, name))
+
+    # --- « The fish pond is empty » : arrêt -----------------------------------
+    @staticmethod
+    def pond_frame(size=(2560, 1600)):
+        """Écran avec la vraie bannière « The fish pond is empty » (à l'échelle de
+        l'interface : 0,675 en 1920×1080)."""
+        w, h = size
+        frame = np.full((h, w, 3), 70, np.uint8)
+        banner = cv2.imread(str(ROOT / "templates" / "originals" / "fish pond empty.png"))
+        scale = h / 1600
+        if scale != 1:
+            banner = cv2.resize(banner, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        bw = min(w, banner.shape[1])
+        x = (w - bw) // 2
+        y = int(h * 0.12)
+        frame[y:y + banner.shape[0], x:x + bw] = banner[:, :bw]
+        return frame
+
+    def test_pond_empty_stops_frenzy(self):
+        """Bannière affichée : le script s'arrête, sans touche ni clic."""
+        hook.grab = lambda region=None: self.pond_frame()
+        hook.Frenzy(hook.Config()).run()          # revient au lieu de boucler
+        self.assertEqual(self.events, [])
+
+    def test_pond_empty_in_1920x1080(self):
+        hook.search_region = lambda: (0, 0, 1920, 1080)
+        hook.UI.configure(1920, 1080)
+        try:
+            hook.grab = lambda region=None: self.pond_frame((1920, 1080))
+            hook.Frenzy(hook.Config()).run()
+            self.assertEqual(self.events, [])
+        finally:
+            hook.UI.configure(2560, 1600)
+
+    def test_pond_empty_after_start_fishing_no_new_start(self):
+        """Bannière juste après « Start Fishing » (message éphémère, panneau encore
+        affiché) : arrêt, pas de second « Start Fishing »."""
+        frames = [cv2.imread(str(PREPARATIONS))]
+        hook.grab = lambda region=None: frames[0]
+        hook.click_box = lambda box: (self.events.append(("click", box)),
+                                      frames.__setitem__(0, self.pond_frame()))
+        hook.Frenzy(hook.Config()).run()
+        self.assertEqual([e[0] for e in self.events], ["click"])
+
+    def test_tools_aim_a_little_above_center(self):
+        """Lancers (filet, bombe) : un tout petit peu au-dessus du centre."""
+        frenzy = hook.Frenzy(hook.Config())
+        for size in ((2560, 1600), (1920, 1080)):
+            hook.search_region = lambda s=size: (0, 0, *s)
+            for _ in range(200):
+                x, y, w, h = frenzy.aim_box()
+                cx, cy = (x + w / 2) / size[0], (y + h / 2) / size[1]
+                self.assertTrue(0.48 <= cx <= 0.52, cx)
+                self.assertTrue(0.445 <= cy <= 0.475, cy)
+        # Les lancers passent bien par là.
+        hook.search_region = lambda: (0, 0, 2560, 1600)
+        aimed = []
+        real_aim = hook.Frenzy.aim_box
+        hook.Frenzy.aim_box = lambda self_: aimed.append(1) or real_aim(self_)
+        try:
+            self.play(self.game_frame(["net"]), 30)
+        finally:
+            hook.Frenzy.aim_box = real_aim
+        self.assertEqual(len(aimed), len(self.throws()))
+        self.assertGreaterEqual(len(aimed), 4)
 
     @unittest.skipUnless(sys.platform == "win32", "Windows uniquement")
     def test_net_key_is_the_key_labelled_w(self):

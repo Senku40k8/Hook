@@ -126,7 +126,8 @@ Un cycle sans fin, décidé d'après ce qui est à l'écran :
 - **Panneau « Fishing Preparations »** : il clique sur « Start Fishing ». Il n'appuie jamais
   sur F sur ce panneau.
 - **Filet ou bombe affichés** (icônes avec W et E) : plus de clics rapides jusqu'à la fin
-  de la partie, seulement des lancers. Un lancer = la touche de l'outil, puis un clic. Les
+  de la partie, seulement des lancers. Un lancer = la touche de l'outil, puis un clic un
+  tout petit peu au-dessus du centre de l'écran (3 à 5 % de la hauteur). Les
   touches sont celles marquées W et E sur le clavier, même en AZERTY (W en bas à gauche).
   - Filet seul : W plusieurs fois au début (5 à 8 fois sur 2 à 4 s), puis un clic à chaque
     fin de recharge (5 s, plus 0,3 à 1 s au hasard).
@@ -137,6 +138,9 @@ Un cycle sans fin, décidé d'après ce qui est à l'écran :
   - Une bombe débloquée en cours de partie rejoint le cycle dès qu'elle est vue.
   - À la fin de la partie : Échap, « Start Fishing », et le cycle reprend.
 - **Sinon** : il clique près du centre de l'écran, environ deux fois par seconde.
+- **« The fish pond is empty »** : plus de poissons, le script s'arrête (pas de nouveau
+  « Start Fishing »). Ce message est guetté à chaque examen de l'écran et juste après F
+  et « Start Fishing ».
 
 Les clics sont humains. Le point visé est un peu décalé du centre, tiré au hasard à
 chaque lancement, puis il dérive lentement. Le trajet de la souris, la durée d'appui et

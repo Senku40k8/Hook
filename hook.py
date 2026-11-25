@@ -2836,6 +2836,12 @@ FRENZY_NET_KEY = FRENZY_TOOLS["net"][0]
 FRENZY_TOOL_MARGIN: Range = (0.3, 1.0)        # en plus du temps de recharge
 FRENZY_TOOL_GAP: Range = (0.8, 1.5)           # au moins entre deux lancers
 FRENZY_CYCLE = ("net", "net", "bomb")         # deux filets, une bombe
+FRENZY_TOOL_AIM: Range = (0.03, 0.05)         # lancers : un peu au-dessus du centre
+                                              # (fraction de la hauteur de l'écran)
+
+
+class PondEmpty(Exception):
+    """« The fish pond is empty » : plus de poissons, le mode frenzy s'arrête."""
 
 
 class Frenzy:
@@ -2849,7 +2855,10 @@ class Frenzy:
       autre outil était sélectionné) puis un clic. Avec les deux : deux filets,
       une bombe, et ainsi de suite, chaque outil après son temps de recharge
       (5 s filet, 10 s bombe) plus une marge aléatoire ;
-    - sinon : clic au centre de l'écran, à un rythme et un endroit variables.
+    - sinon : clic au centre de l'écran, à un rythme et un endroit variables ;
+    - « The fish pond is empty » : arrêt du script (pas de nouveau « Start
+      Fishing »). Guetté à chaque examen et juste après F et « Start Fishing ».
+    Les lancers visent un peu au-dessus du centre.
     L'écran (0,1 à 0,3 s d'analyse) est examiné au lancement, après chaque action,
     à chaque clic pendant les 4 premières secondes d'une partie et avec les
     outils, sinon tous les 3 à 6 clics."""
@@ -2867,6 +2876,9 @@ class Frenzy:
             if path.exists():
                 self.tool_icons[tool] = BannerDetector(path, cfg.restock_threshold,
                                                        cfg.banner_scales)
+        pond = cfg.templates_dir / "frenzy" / "pond_empty.png"
+        self.pond = BannerDetector(pond, cfg.restock_threshold, cfg.banner_scales) \
+            if pond.exists() else None
         self.clock = time.perf_counter
         self.reset_tools()
         self.started_at = 0.0               # dernier « Start Fishing »
@@ -2920,7 +2932,7 @@ class Frenzy:
                 sleep(human.within((0.12, 0.25)))
             self.selected = tool
             sleep(human.within((0.1, 0.25)))
-        click_box(self.center_box())
+        click_box(self.aim_box())
         self.last_throw[tool] = self.clock()
         self.cycle_pos += 1
         log.info("%s lancé%s.", label.capitalize(), "e" if tool == "bomb" else "")
@@ -2932,6 +2944,8 @@ class Frenzy:
         frame = grab(region)
         # « Start Fishing » : en bas à droite du panneau (x ≈ 79 %, y ≈ 84 %).
         h, w = frame.shape[:2]
+        if self.pond_empty(frame):
+            return "empty", None
         # « Press empty area to close » : en bas, au milieu (y ≈ 90 %).
         if self.close_visible(frame):
             return "close", None
@@ -2952,6 +2966,36 @@ class Frenzy:
             frame = grab(search_region())
         h, w = frame.shape[:2]
         return self.close.detect(frame[int(h * 0.6):, w // 4:w * 3 // 4])
+
+    def pond_empty(self, frame: Optional[np.ndarray] = None) -> bool:
+        if self.pond is None:
+            return False
+        if frame is None:
+            frame = grab(search_region())
+        return self.pond.detect(frame)
+
+    def watch_pond(self, duration: Range) -> None:
+        """Attente après F ou « Start Fishing », en guettant « The fish pond is
+        empty » (message qui ne reste affiché que quelques secondes)."""
+        end = self.clock() + human.within(duration)
+        while True:
+            if self.pond_empty():
+                raise PondEmpty()
+            left = end - self.clock()
+            if left <= 0:
+                return
+            sleep(min(left, human.within((0.25, 0.45))))
+
+    def aim_box(self) -> Region:
+        """Zone de lancer des outils : un tout petit peu au-dessus du centre de la
+        fenêtre (3 à 5 % de la hauteur), à peine décalée d'un lancer à l'autre."""
+        x, y, w, h = search_region()
+        r = human.rng
+        ox = max(-0.015, min(0.015, r.gauss(0, 0.006)))
+        oy = -human.within(FRENZY_TOOL_AIM)
+        bw, bh = int(w * r.uniform(0.015, 0.025)), int(h * r.uniform(0.015, 0.025))
+        cx, cy = x + w * (0.5 + ox), y + h * (0.5 + oy)
+        return int(cx - bw / 2), int(cy - bh / 2), bw, bh
 
     def center_box(self) -> Region:
         """Zone de clic près du centre de la fenêtre (pas pile dessus), déplacée un
@@ -2977,6 +3021,8 @@ class Frenzy:
             self.until_check = human.rng.randint(3, 6)
         if state != "other":
             self.until_check = 0            # vérifier le résultat au tour suivant
+        if state == "empty":
+            raise PondEmpty()
         if state in ("close", "panel"):
             self.reset_tools()              # partie terminée : outils à revoir
         if state == "tools":
@@ -3023,13 +3069,13 @@ class Frenzy:
             log.info("« Start Fishing »")
             click_box(box)
             self.started_at = self.clock()
-            sleep(human.within((1.0, 1.8)))
+            self.watch_pond((1.0, 1.8))
             return
         if state == "prompt":
             sleep(human.reaction())
             log.info("Invite « Fishing » : touche %s", self.cfg.key_action.upper())
             tap(self.cfg.key_action, self.cfg.action_press_duration)
-            sleep(human.within((1.2, 2.0)))              # ouverture du panneau
+            self.watch_pond((1.2, 2.0))                  # ouverture du panneau
             return
         click_box(self.center_box())
         self.clicks += 1
@@ -3056,6 +3102,9 @@ class Frenzy:
             except ResumeRequested:
                 log.info("Reprise.")
                 sleep(human.within((1.0, 2.0)))
+            except PondEmpty:
+                log.info("« The fish pond is empty » : plus de poissons, fin du mode frenzy.")
+                return
 
 
 _instance_mutex = None
